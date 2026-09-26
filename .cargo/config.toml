@@ -1,0 +1,3 @@
+# Keep build output out of OneDrive (sync + file locks break incremental builds).
+[build]
+target-dir = "C:/Users/sbritos/.cargo-target/kxs-watcher"

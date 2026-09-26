@@ -1,0 +1,53 @@
+# KXS Watcher
+
+Fast, lightweight native Kubernetes / k3s desktop GUI (a Lens alternative). Pure Rust:
+egui (GPU-rendered, no webview), kube-rs, egui_dock, egui_term.
+
+## Run
+
+```
+cargo run --release
+```
+
+Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
+`helm` on PATH enables the Helm Releases view.
+
+## Features
+
+- **Catalog**: contexts from `~/.kube/config`, `$KUBECONFIG` and any extra files/folders
+  (Settings; `~/.kube` is scanned by default). Pick files or folders on disk with the native file
+  dialog (➕ in the catalog, File menu, Settings). Pin, filter, open several clusters as tabs.
+- **Live lists** for every resource kind, including CRDs, built from the API server's Table
+  output (the same columns as `kubectl get`, `Wide` = `-o wide`). Multi-namespace filter, search, sort,
+  status colors, CPU/memory columns for pods and nodes (metrics-server).
+- **Multi-select**: checkboxes, Ctrl/Shift+click, Ctrl+A. Bulk open, merged logs, restart, scale,
+  edit YAML, copy names, delete (one confirmation, one summary).
+- **Object sub-tabs** inside each cluster tab (double-click a row). Details per kind link to
+  everything they reference: owner, node, service account, config maps, secrets, volume claims,
+  ingress backends, role bindings, HPA targets, event objects… plus related pods/ReplicaSets/Jobs.
+- **Secret / ConfigMap editor**: edit, add and remove keys, Save (conflicts are detected).
+- **Actions**: edit YAML, create from YAML (multi-document, server-side apply), delete, scale,
+  rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
+- **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
+  wrap, timestamps, previous container, Ctrl+F find (plain or regex, only-matching), scrolling to the
+  top loads earlier lines, dropped connections resume on their own.
+- **Ctrl+K** finds text in the current view (lists, details, YAML, logs). Collapsed sections with
+  matches open; hidden secret values are searched too and flagged without being revealed.
+- **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
+  name, in all or the selected namespaces. Secret values stay masked unless shown; a click opens the
+  object with the same text highlighted.
+- **Accent color per cluster**: tab title, outline, frame and selections, also on the logs,
+  terminals and editors opened from it. New clusters get a free color; right-click a context to pick
+  another swatch or any custom color.
+- **Dock tabs**: logs, pod shell, local terminal pinned to a context (no credentials copied), YAML editor.
+- **Overview**: cluster CPU/memory/pods, per-node usage, live warning events (repeats grouped);
+  workloads overview.
+- **Helm**: releases, values/manifest/notes, history, rollback, uninstall.
+
+## Develop
+
+```
+cargo test
+```
+
+`.cargo/config.toml` keeps build output outside OneDrive.
