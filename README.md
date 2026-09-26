@@ -16,7 +16,7 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 
 - **Catalog**: contexts from `~/.kube/config`, `$KUBECONFIG` and any extra files/folders
   (Settings; `~/.kube` is scanned by default). Pick files or folders on disk with the native file
-  dialog (➕ in the catalog, File menu, Settings). Pin, filter, open several clusters as tabs.
+  dialog ("Add kubeconfig…" in the catalog, File menu, Settings). Pin, filter, open several clusters as tabs.
 - **Live lists** for every resource kind, including CRDs, built from the API server's Table
   output (the same columns as `kubectl get`, `Wide` = `-o wide`). Multi-namespace filter, search, sort,
   status colors, CPU/memory columns for pods and nodes (metrics-server).
@@ -51,3 +51,18 @@ cargo test
 ```
 
 `.cargo/config.toml` keeps build output outside OneDrive.
+
+## Installer and releases
+
+Needs WiX (`dotnet tool install --global wix`).
+
+```
+.\build_msi.ps1                 # release build + MSI in target\KXS-Watcher\
+.\publish_github.ps1 -Tag v0.2.0 -DryRun   # show what would be published
+.\publish_github.ps1 -Tag v0.2.0           # push the branch, tag, create the GitHub release, upload the MSI
+.\publish_release.ps1                      # same, with the tag v<version from Cargo.toml>
+```
+
+The MSI installs per user (no admin prompt) into `%LocalAppData%\Programs\KXS Watcher` with a Start
+menu entry. Its version is the x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
+refuses uncommitted changes and a tag that already exists on another commit.

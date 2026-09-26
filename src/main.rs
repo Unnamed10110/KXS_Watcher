@@ -359,10 +359,18 @@ impl App {
                 if ui.small_button("⟳").on_hover_text("Rescan kubeconfig files").clicked() {
                     self.rescan();
                 }
-                if ui.small_button("➕").on_hover_text("Add kubeconfig files from disk").clicked() {
-                    self.pick_kubeconfigs(&ctx, false);
-                }
             });
+        });
+        ui.horizontal(|ui| {
+            if ui.button("➕ Add kubeconfig…").on_hover_text("Pick kubeconfig files on disk").clicked() {
+                self.pick_kubeconfigs(&ctx, false);
+            }
+            if ui.button("📂 Folder…").on_hover_text("Add a folder: every kubeconfig in it (one level deep)").clicked() {
+                self.pick_kubeconfigs(&ctx, true);
+            }
+            if self.picking.is_some() {
+                ui.spinner();
+            }
         });
         ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔍 Filter contexts…").desired_width(f32::INFINITY));
         ui.add_space(4.0);
