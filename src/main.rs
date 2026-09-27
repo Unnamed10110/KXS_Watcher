@@ -8,6 +8,7 @@ mod list;
 mod ops;
 mod search;
 mod tabs;
+mod theme;
 mod watch;
 
 use std::collections::{HashMap, HashSet};
@@ -90,7 +91,7 @@ impl Out {
 struct Settings {
     /// Extra kubeconfig files or folders (folders are scanned one level deep).
     paths: Vec<PathBuf>,
-    theme: egui::ThemePreference,
+    theme: theme::Theme,
     pinned: Vec<String>,
     open: Vec<String>,
     zoom: f32,
@@ -128,7 +129,7 @@ impl Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { paths: vec![kubeconfig::default_dir()], theme: egui::ThemePreference::Dark, pinned: vec![], open: vec![], zoom: 1.0, node_shell_image: "busybox:1.36".into(), tabs: HashMap::new(), accents: HashMap::new() }
+        Settings { paths: vec![kubeconfig::default_dir()], theme: theme::Theme::Dark, pinned: vec![], open: vec![], zoom: 1.0, node_shell_image: "busybox:1.36".into(), tabs: HashMap::new(), accents: HashMap::new() }
     }
 }
 
@@ -217,7 +218,7 @@ impl TabViewer for Viewer<'_> {
         }
         if let Some(c) = self.accent(t) {
             let v = ui.visuals_mut(); // selections (rows, nav, tabs) take the cluster's accent
-            v.selection.bg_fill = c.gamma_multiply(if v.dark_mode { 0.55 } else { 0.35 });
+            v.selection.bg_fill = theme::mix(v.panel_fill, c, if v.dark_mode { 0.45 } else { 0.3 });
         }
         let first_new = self.out.tabs.len();
         match &mut t.body {
@@ -240,7 +241,7 @@ impl TabViewer for Viewer<'_> {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, term_rx: Receiver<(u64, PtyEvent)>) -> Self {
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
-        cc.egui_ctx.set_theme(settings.theme);
+        theme::apply(&cc.egui_ctx, settings.theme);
         cc.egui_ctx.set_zoom_factor(settings.zoom);
         let mut app = App {
             contexts: kubeconfig::discover(&settings.paths),
@@ -530,14 +531,11 @@ impl App {
                 }
             });
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Theme").strong());
-                for (t, name) in [(egui::ThemePreference::Dark, "Dark"), (egui::ThemePreference::Light, "Light"), (egui::ThemePreference::System, "System")] {
-                    if ui.selectable_value(&mut self.settings.theme, t, name).changed() {
-                        ctx.set_theme(t);
-                    }
-                }
-            });
+            ui.label(RichText::new("Theme").strong());
+            if theme::picker(ui, &mut self.settings.theme) {
+                theme::apply(ctx, self.settings.theme);
+            }
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Zoom").strong());
                 if ui.add(egui::Slider::new(&mut self.settings.zoom, 0.7..=2.0).step_by(0.05)).changed() {
@@ -637,11 +635,13 @@ impl eframe::App for App {
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.sidebar, "Cluster catalog");
-                    for (t, name) in [(egui::ThemePreference::Dark, "Dark theme"), (egui::ThemePreference::Light, "Light theme"), (egui::ThemePreference::System, "System theme")] {
-                        if ui.selectable_value(&mut self.settings.theme, t, name).clicked() {
-                            ctx.set_theme(t);
+                    ui.menu_button("Theme", |ui| {
+                        for t in theme::ALL {
+                            if ui.selectable_value(&mut self.settings.theme, t, t.name()).clicked() {
+                                theme::apply(&ctx, t);
+                            }
                         }
-                    }
+                    });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("{} contexts", self.contexts.len())).weak());

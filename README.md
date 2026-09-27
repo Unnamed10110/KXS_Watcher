@@ -36,6 +36,8 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
   name, in all or the selected namespaces. Secret values stay masked unless shown; a click opens the
   object with the same text highlighted.
+- **Themes**: Dark, Light, System, AMOLED (pure black) in cyan, red and green, Crimson, Forest,
+  Ocean and Violet (Settings or View → Theme).
 - **Accent color per cluster**: tab title, outline, frame and selections, also on the logs,
   terminals and editors opened from it. New clusters get a free color; right-click a context to pick
   another swatch or any custom color.
