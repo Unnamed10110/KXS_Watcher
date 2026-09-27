@@ -33,3 +33,11 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# egui 0.35.0 with editor-style text selection: double-click selects whole IPs, names and labels,
+# double-click + drag extends by words (vendor/egui/KXS_PATCH.md). Drop when upgrading egui.
+[patch.crates-io]
+egui = { path = "vendor/egui" }
+
+[build-dependencies]
+embed-resource = "3.0.11"

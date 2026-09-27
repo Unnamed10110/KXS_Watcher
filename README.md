@@ -14,6 +14,10 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 
 ## Features
 
+- **Graphite design**: a top bar with the open clusters as colored pills, the Ctrl+K search box, warnings
+  (click for the overview), theme and settings; a cluster sidebar with object counts; card-based
+  overview, details and settings. Uses Segoe UI and Cascadia Mono, or Geist and JetBrains Mono when
+  installed. The cluster list opens from "+" (and is the start screen).
 - **Catalog**: contexts from `~/.kube/config`, `$KUBECONFIG` and any extra files/folders
   (Settings; `~/.kube` is scanned by default). Pick files or folders on disk with the native file
   dialog ("Add kubeconfig…" in the catalog, File menu, Settings). Pin, filter, open several clusters as tabs.
@@ -36,11 +40,14 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
   name, in all or the selected namespaces. Secret values stay masked unless shown; a click opens the
   object with the same text highlighted.
-- **Themes**: Dark, Light, System, AMOLED (pure black) in cyan, red and green, Crimson, Forest,
-  Ocean and Violet (Settings or View → Theme).
+- **Themes**: Dark, Light, System, AMOLED in eight neon colors (cyan, red, green, purple, pink,
+  blue, yellow, orange: pure black, only the accent lights up), Crimson, Forest, Ocean and Violet.
+- **Tabs**: Ctrl+T (or "+" after the page tabs) opens a new tab: type to pick a view or resource list.
+- **Text selection like an editor**: double-click selects a whole IP, name, image or `key=value` label,
+  double-click and drag extends by words, triple-click selects the line (a patched egui in `vendor/egui`).
 - **Accent color per cluster**: tab title, outline, frame and selections, also on the logs,
-  terminals and editors opened from it. New clusters get a free color; right-click a context to pick
-  another swatch or any custom color.
+  terminals and editors opened from it. New clusters get a free color (a neon one under AMOLED); right-click a
+  cluster pill or context for soft and neon swatches or any custom color.
 - **Dock tabs**: logs, pod shell, local terminal pinned to a context (no credentials copied), YAML editor.
 - **Overview**: cluster CPU/memory/pods, per-node usage, live warning events (repeats grouped);
   workloads overview.
@@ -59,7 +66,10 @@ cargo test
 Needs WiX (`dotnet tool install --global wix`).
 
 ```
-.\build_msi.ps1                 # release build + MSI in target\KXS-Watcher\
+build.bat                       # release build; the exe is copied to target\KXS-Watcher\
+build.bat msi                   # the same, plus the MSI
+.\build_msi.ps1                 # release build + MSI in target\KXS-Watcher\ (Cargo.toml's version)
+.\build_msi.ps1 -Version 0.2.0  # same, as MSI version 0.2.0 (tag forms like v.0.2.0 work too)
 .\publish_github.ps1 -Tag v0.2.0 -DryRun   # show what would be published
 .\publish_github.ps1 -Tag v0.2.0           # push the branch, tag, create the GitHub release, upload the MSI
 .\publish_release.ps1                      # same, with the tag v<version from Cargo.toml>
@@ -67,6 +77,7 @@ Needs WiX (`dotnet tool install --global wix`).
 
 The MSI is a wizard: pick the install folder (default `%LocalAppData%\Programs\KXS Watcher`, per user,
 no admin prompt), Start menu and Desktop shortcuts, and launch at the end. Any installed version is
-replaced (a clean install, downgrades too); running the same MSI again reinstalls it. Its version is the
+replaced (a clean install, downgrades too). Running the same MSI again, or Settings → Installed apps →
+KXS Watcher → Modify, opens Change / Repair / Remove; Repair reinstalls every file and shortcut. Its version is the
 x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
 refuses uncommitted changes and a tag that already exists on another commit.

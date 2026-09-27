@@ -1,6 +1,6 @@
 //! One cluster tab: connect + discovery, sidebar navigation, resource lists with object sub-tabs,
 //! overview pages, Helm releases and port forwards.
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -19,8 +19,10 @@ use crate::kubeconfig::{self, Ctx};
 use crate::list::{List, Pick};
 use crate::ops::{self, fmt_bytes, fmt_cpu, Forward, Kind, Metrics, Res};
 use crate::search::ContentSearch;
+use crate::theme::mix;
+use crate::ui_kit::{self, Btn, Icon};
 use crate::tabs::{self, LogTab, YamlTab};
-use crate::watch::{self, cell_color, contains_ci, take, Bg, ListData, Pending, Row, Shared, GREEN, RED};
+use crate::watch::{self, cell_color, contains_ci, take, Bg, ListData, Pending, Row, Shared, GREEN, ORANGE, RED};
 use crate::{next_id, Body, Out};
 
 pub static HELM: LazyLock<bool> = LazyLock::new(|| ops::tool_available("helm"));
@@ -76,10 +78,62 @@ enum Page {
     Helm,
     /// Text search inside Config Maps and Secrets.
     Search,
+    /// A new tab (Ctrl+T): pick what it shows.
+    Launcher,
 }
 
 fn kind_page(g: &str, k: &str) -> Page {
     Page::Kind(g.into(), k.into())
+}
+
+/// Two letters for the cluster avatar: "k8s-qa" → "QA", "rancher-desktop" → "RD".
+fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty() && !matches!(w.to_ascii_lowercase().as_str(), "k8s" | "k3s" | "kube" | "cluster" | "context")).collect();
+    let s: String = match words.as_slice() {
+        [] => name.chars().filter(char::is_ascii_alphanumeric).take(2).collect(),
+        [w] => w.chars().take(2).collect(),
+        [a, b, ..] => a.chars().take(1).chain(b.chars().take(1)).collect(),
+    };
+    s.to_uppercase()
+}
+
+/// Collapsible sidebar group header; returns whether it is open (kept per title).
+fn nav_section(ui: &mut Ui, title: &str, default_open: bool) -> bool {
+    let id = ui.make_persistent_id(("nav-section", title));
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
+    let t = ui_kit::tokens(ui);
+    ui.add_space(4.0);
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+    let open = state.is_open();
+    let color = if r.hovered() { t.muted } else { t.dim };
+    ui_kit::paint_icon(ui, egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(11.0, 11.0)), if open { Icon::ChevronDown } else { Icon::ChevronRight }, color);
+    ui.painter().text(egui::pos2(rect.left() + 28.0, rect.center().y), egui::Align2::LEFT_CENTER, title.to_uppercase(), ui_kit::semibold(11.0), color);
+    if r.clicked() {
+        state.toggle(ui);
+    }
+    state.store(ui.ctx());
+    open
+}
+
+/// One overview number: title, value, a usage bar and a footnote.
+fn stat_card(ui: &mut Ui, title: &str, value: &str, sub: &str, frac: Option<f32>, foot: &str, warn: bool) {
+    let t = ui_kit::tokens(ui);
+    let (fill, line) = if warn { (mix(t.card, ORANGE, 0.05), mix(t.card, ORANGE, 0.3)) } else { (t.card, t.line) };
+    egui::Frame::new().fill(fill).stroke(egui::Stroke::new(1.0, line)).corner_radius(egui::CornerRadius::same(12)).inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui_kit::section_label(ui, title);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(value).font(ui_kit::semibold(28.0)).color(if warn { ui_kit::status_fg(ui, ORANGE) } else { t.text }));
+            ui.label(RichText::new(sub).color(t.muted));
+        });
+        let w = ui.available_width();
+        match frac {
+            Some(f) => ui_kit::bar(ui, f, w, if f > 0.85 { RED } else { t.accent }),
+            None => ui.allocate_exact_size(egui::vec2(w, 6.0), egui::Sense::hover()).1,
+        };
+        ui.add(egui::Label::new(RichText::new(foot).size(12.0).color(t.dim)).truncate());
+    });
 }
 
 struct Conn {
@@ -129,12 +183,33 @@ impl ClusterTab {
         }
     }
 
+    /// Distinct warning events (repeats grouped), for the top bar's bell.
+    pub fn warning_count(&self) -> Option<usize> {
+        self.ready.as_ref()?.warnings.as_ref().map(|l| l.grouped_len())
+    }
+
+    /// Ctrl+T: a new tab.
+    pub fn new_tab(&mut self) {
+        if let Some(r) = &mut self.ready {
+            r.new_tab();
+        }
+    }
+
+    /// The bell: show this cluster's overview.
+    pub fn show_overview(&mut self, ctx: &egui::Context) {
+        if let Some(r) = &mut self.ready {
+            r.show_page(ctx, Page::Overview, false);
+        }
+    }
+
     /// Ctrl+K: find in the view. Ctrl+F (`filter`): focus the list's filter box (find elsewhere).
     pub fn open_find(&mut self, filter: bool) {
         if let Some(r) = &mut self.ready {
             let page = r.pages.get_mut(r.cur).filter(|p| p.active == 0);
             let on_list = page.as_ref().is_some_and(|p| matches!(p.page, Page::Kind(..)));
-            if let Some(cs) = page.and_then(|p| p.content.as_mut()) {
+            if page.as_ref().is_some_and(|p| p.page == Page::Launcher) {
+                r.focus_launcher = true;
+            } else if let Some(cs) = page.and_then(|p| p.content.as_mut()) {
                 cs.focus = true; // the search page's own query box
             } else if filter && on_list {
                 r.focus_filter = true;
@@ -272,7 +347,6 @@ struct PageTab {
     /// Replaced by the next single click in the sidebar (shown in italics).
     preview: bool,
     list: Option<List>,
-    events: Option<List>,
     workloads: Vec<List>,
     /// Object tabs; `active` 0 is the page view, i > 0 is `subs[i - 1]`.
     subs: Vec<ObjTab>,
@@ -280,11 +354,13 @@ struct PageTab {
     /// Details of the clicked row, right of the list.
     panel: Option<ObjTab>,
     content: Option<ContentSearch>,
+    /// New tab: its filter.
+    launch_query: String,
 }
 
 impl PageTab {
     fn new(page: Page, preview: bool) -> Self {
-        PageTab { id: next_id(), page, preview, list: None, events: None, workloads: vec![], subs: vec![], active: 0, panel: None, content: None }
+        PageTab { id: next_id(), page, preview, list: None, workloads: vec![], subs: vec![], active: 0, panel: None, content: None, launch_query: String::new() }
     }
 
     /// (Re)start the watches this page needs; also after a namespace change.
@@ -292,7 +368,6 @@ impl PageTab {
         let kind = |g: &str, k: &str| kinds.iter().find(|x| x.is(g, k)).cloned();
         let keep = self.list.take().map(|l| (l.kind.ar.clone(), l.search, l.filter_re, l.sort));
         self.panel = None;
-        self.events = None;
         self.workloads.clear();
         match &self.page {
             Page::Kind(g, k) => {
@@ -304,7 +379,7 @@ impl PageTab {
                     self.list = Some(l);
                 }
             }
-            Page::Overview => self.events = kind("", "Event").map(|k| List::new(ctx, client, k, ns_sel, Some("type=Warning"))),
+            Page::Overview => {} // uses the cluster's warning watch
             Page::Workloads => self.workloads = WORKLOADS.iter().filter_map(|(g, k)| kind(g, k)).map(|k| List::new(ctx, client, k, ns_sel, None)).collect(),
             Page::Search => {
                 let ns = ns_sel.iter().cloned().collect();
@@ -313,17 +388,18 @@ impl PageTab {
                     None => self.content = Some(ContentSearch::new(ctx, client.clone(), ns)),
                 }
             }
-            Page::Helm | Page::Forwards => {}
+            Page::Helm | Page::Forwards | Page::Launcher => {}
         }
     }
 
     fn title(&self) -> String {
         match &self.page {
-            Page::Overview => "📊 Overview".into(),
+            Page::Overview => "Overview".into(),
             Page::Workloads => "Workloads".into(),
             Page::Forwards => "Port Forwarding".into(),
-            Page::Helm => "⎈ Helm Releases".into(),
-            Page::Search => "🔍 Search".into(),
+            Page::Helm => "Helm releases".into(),
+            Page::Search => "Search".into(),
+            Page::Launcher => "New tab".into(),
             Page::Kind(_, k) => self.list.as_ref().map_or(k.clone(), |l| label(&l.kind)),
         }
     }
@@ -375,6 +451,8 @@ fn nav_target(tabs: &[(&Page, bool)], page: &Page, pin: bool) -> NavTo {
 struct PageEv {
     ns_changed: bool,
     goto: Option<Page>,
+    /// The new tab picked what it shows.
+    replace: Option<Page>,
 }
 
 struct Ready {
@@ -391,10 +469,17 @@ struct Ready {
     wide: bool,
     pages: Vec<PageTab>,
     cur: usize,
+    /// Warning events, always watched: the bell, the Events badge and the overview.
+    warnings: Option<List>,
+    /// Objects per (group, kind) for the sidebar, refreshed in the background.
+    counts: Arc<Mutex<HashMap<(String, String), usize>>>,
+    _counts_bg: Option<Bg>,
     panel_find: Find,
     find: Find,
     /// Ctrl+F: focus the filter box next frame.
     focus_filter: bool,
+    /// Focus the new tab's filter next frame.
+    focus_launcher: bool,
     /// Node shells being started: (node, pending (namespace, pod)).
     node_shells: Vec<(String, Pending<Res<(String, String)>>)>,
     scale_to: i64,
@@ -436,9 +521,13 @@ impl Ready {
             wide: false,
             pages: vec![],
             cur: 0,
+            warnings: None,
+            counts: Default::default(),
+            _counts_bg: None,
             panel_find: Find::default(),
             find: Find::default(),
             focus_filter: false,
+            focus_launcher: false,
             node_shells: vec![],
             scale_to: 1,
             metrics: Default::default(),
@@ -474,8 +563,19 @@ impl Ready {
             let t = r.new_page(ctx, Page::Overview, true);
             r.pages.push(t);
         }
+        r.restart_watches(ctx);
         r.update_metrics(ctx);
         r
+    }
+
+    /// Cluster-wide helpers that follow the namespace filter: warning events and sidebar counts.
+    fn restart_watches(&mut self, ctx: &egui::Context) {
+        self.warnings = self.kind("", "Event").map(|k| List::new(ctx, &self.client, k, &self.ns_sel, Some("type=Warning")));
+        let node = [("", "Node", ""), ("", "Namespace", "")];
+        let kinds: Vec<Kind> = NAV.iter().flat_map(|(_, e)| e.iter()).chain(node.iter()).filter_map(|(g, k, _)| self.kind(g, k)).collect();
+        self.counts.lock().unwrap().clear();
+        let ns = self.ns_sel.iter().cloned().collect();
+        self._counts_bg = Some(Bg::spawn(ops::count_loop(self.client.clone(), kinds, ns, self.counts.clone(), ctx.clone())));
     }
 
     fn saved(&self) -> SavedTabs {
@@ -505,8 +605,33 @@ impl Ready {
         t
     }
 
+    /// Ctrl+T or "+": a new tab that asks what to show.
+    fn new_tab(&mut self) {
+        self.pages.push(PageTab::new(Page::Launcher, false));
+        self.cur = self.pages.len() - 1;
+        self.focus_launcher = true;
+    }
+
+    /// The current new tab becomes `page` (or, when that page is already open, goes away for it).
+    fn replace_launcher(&mut self, ctx: &egui::Context, page: Page) {
+        match self.pages.iter().position(|t| t.page == page) {
+            Some(i) => {
+                self.pages.remove(self.cur);
+                self.cur = if i > self.cur { i - 1 } else { i };
+            }
+            None => {
+                let t = self.new_page(ctx, page, false);
+                self.pages[self.cur] = t;
+            }
+        }
+        self.pages[self.cur].active = 0;
+    }
+
     /// Sidebar click: focus an open page, else preview it (single) or open its own tab (double).
     fn show_page(&mut self, ctx: &egui::Context, page: Page, pin: bool) {
+        if self.pages.get(self.cur).is_some_and(|t| t.page == Page::Launcher) {
+            return self.replace_launcher(ctx, page); // the new tab takes what the sidebar opens
+        }
         let tabs: Vec<(&Page, bool)> = self.pages.iter().map(|t| (&t.page, t.preview)).collect();
         match nav_target(&tabs, &page, pin) {
             NavTo::Focus(i) => {
@@ -598,8 +723,10 @@ impl Ready {
             None => true,
         });
 
-        let mut nav = None;
-        egui::Panel::left(egui::Id::new(("nav", self.kctx.id()))).resizable(true).default_size(210.0).size_range(150.0..=400.0).show(ui, |ui| nav = self.nav(ui, out));
+        let t = ui_kit::tokens(ui);
+        let (mut nav, mut nav_ns) = (None, false);
+        let nav_frame = egui::Frame::new().fill(t.chrome).inner_margin(egui::Margin::symmetric(8, 0)).stroke(egui::Stroke::new(1.0, t.line));
+        egui::Panel::left(egui::Id::new(("nav", self.kctx.id()))).resizable(true).default_size(240.0).size_range(190.0..=400.0).frame(nav_frame).show(ui, |ui| (nav, nav_ns) = self.nav(ui, out));
         if let Some((p, pin)) = nav {
             self.show_page(&ctx, p, pin);
         }
@@ -607,7 +734,7 @@ impl Ready {
         // Page views need `&mut self` too: draw them with the page tabs taken out, put them back after.
         let (mut acts, mut ev) = (Vec::new(), PageEv::default());
         let mut pages = std::mem::take(&mut self.pages);
-        egui::Panel::top(egui::Id::new(("tabs", self.kctx.id()))).show(ui, |ui| {
+        egui::Panel::top(egui::Id::new(("tabs", self.kctx.id()))).frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 8, right: 12, top: 0, bottom: 2 })).show(ui, |ui| {
             self.page_tabs_ui(ui, &mut pages);
             if let Some(pt) = pages.get_mut(self.cur) {
                 self.subtabs_ui(ui, pt);
@@ -617,7 +744,7 @@ impl Ready {
         match pages.get_mut(self.cur) {
             Some(pt) => {
                 self.panel_ui(ui, pt, &mut acts);
-                egui::CentralPanel::default().show(ui, |ui| self.page_ui(ui, pt, out, &mut acts, &mut ev));
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 10, bottom: 8 })).show(ui, |ui| self.page_ui(ui, pt, out, &mut acts, &mut ev));
             }
             None => {
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -630,10 +757,14 @@ impl Ready {
         }
         self.pages = pages;
 
-        if ev.ns_changed {
+        if ev.ns_changed || nav_ns {
             for pt in &mut self.pages {
                 pt.load(&ctx, &self.client, &self.kinds, &self.ns_sel);
             }
+            self.restart_watches(&ctx);
+        }
+        if let Some(p) = ev.replace {
+            self.replace_launcher(&ctx, p);
         }
         if let Some(p) = ev.goto {
             self.show_page(&ctx, p, false);
@@ -649,7 +780,7 @@ impl Ready {
         if pt.active == 0 {
             match pt.page.clone() {
                 Page::Kind(..) => ev.ns_changed |= self.list_page(ui, pt, out, acts),
-                Page::Overview => self.overview(ui, pt, acts),
+                Page::Overview => ev.ns_changed |= self.overview(ui, acts),
                 Page::Workloads => {
                     let (goto, changed) = self.workloads_ui(ui, pt);
                     ev.goto = goto;
@@ -658,11 +789,12 @@ impl Ready {
                 Page::Forwards => self.forwards_ui(ui),
                 Page::Helm => ev.ns_changed |= self.helm_ui(ui),
                 Page::Search => ev.ns_changed |= self.search_page(ui, pt),
+                Page::Launcher => ev.replace = self.launcher_ui(ui, pt),
             }
         } else if let Some(t) = pt.subs.get_mut(pt.active - 1) {
             let mut dacts = vec![];
             // Object tabs share widget ids (grids, collapsing headers): keep their state apart.
-            ui.push_id(t.id, |ui| t.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.find));
+            ui.push_id(t.id, |ui| t.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.find, true));
             acts.extend(dacts.into_iter().map(|a| (vec![t.details.t.clone()], a)));
         }
     }
@@ -675,12 +807,17 @@ impl Ready {
         let Some(p) = &mut pt.panel else { return };
         let (mut close, mut to_tab, mut dacts) = (false, false, vec![]);
         let max = (ui.available_width() - 360.0).max(320.0);
-        egui::Panel::right(egui::Id::new(("details", self.kctx.id(), pt.id))).resizable(true).default_size(480.0).size_range(320.0..=max).show(ui, |ui| {
+        let t = ui_kit::tokens(ui);
+        let frame = egui::Frame::new().fill(t.panel).inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 8 }).stroke(egui::Stroke::new(1.0, t.line));
+        egui::Panel::right(egui::Id::new(("details", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                to_tab = ui.button("↗ Open in tab").on_hover_text("Open in its own tab (double-click a row does the same)").clicked();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| close = ui.button("×").on_hover_text("Close (Esc)").clicked());
+                ui_kit::section_label(ui, &p.details.t.kind.ar.kind);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui_kit::icon_button(ui, Icon::X, 26.0, "Close (Esc)").clicked();
+                    to_tab = ui_kit::button(ui, Btn::Ghost, Some(Icon::External), "Open in tab").on_hover_text("Open in its own tab (double-click a row does the same)").clicked();
+                });
             });
-            ui.push_id(p.id, |ui| p.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.panel_find));
+            ui.push_id(p.id, |ui| p.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.panel_find, false));
         });
         let t = p.details.t.clone();
         acts.extend(dacts.into_iter().map(|a| (vec![t.clone()], a)));
@@ -695,35 +832,29 @@ impl Ready {
     /// First tab row: one tab per page (Pods, Deployments…); the preview tab is in italics.
     fn page_tabs_ui(&mut self, ui: &mut Ui, pages: &mut Vec<PageTab>) {
         let (mut close, mut keep_only) = (None, None);
+        let t = ui_kit::tokens(ui);
         ui.scope(|ui| {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal().id_salt(("pagetabs", self.kctx.id())).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, t) in pages.iter_mut().enumerate() {
-                        if i > 0 {
-                            ui.separator();
-                        }
-                        let mut text = RichText::new(t.title());
-                        if t.preview {
-                            text = text.italics();
-                        }
-                        if i == self.cur {
-                            text = text.strong();
-                        }
-                        let tip = if t.preview { "Preview: the next single click in the sidebar replaces it. Double-click to keep it." } else { "Middle-click to close" };
-                        let r = ui.selectable_label(i == self.cur, text).on_hover_text(tip);
+                    ui.set_height(38.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, pt) in pages.iter_mut().enumerate() {
+                        ui.add_space(if i == 0 { 10.0 } else { 18.0 });
+                        let tip = if pt.preview { "Preview: the next single click in the sidebar replaces it. Double-click to keep it." } else { "Middle-click to close" };
+                        let r = ui_kit::tab(ui, &pt.title(), i == self.cur, pt.preview, false).on_hover_text(tip);
                         if r.double_clicked() {
-                            t.preview = false;
+                            pt.preview = false;
                         }
                         if r.clicked() {
                             self.cur = i;
                         }
-                        if r.middle_clicked() || ui.small_button("×").clicked() {
+                        if r.middle_clicked() || ui_kit::icon_button(ui, Icon::X, 20.0, "Close").clicked() {
                             close = Some(i);
                         }
                         r.context_menu(|ui| {
-                            if t.preview && ui.button("Keep open").clicked() {
-                                t.preview = false;
+                            if pt.preview && ui.button("Keep open").clicked() {
+                                pt.preview = false;
                                 ui.close();
                             }
                             if ui.button("Close").clicked() {
@@ -740,9 +871,16 @@ impl Ready {
                             }
                         });
                     }
+                    ui.add_space(10.0);
+                    if ui_kit::icon_button(ui, Icon::Plus, 24.0, "New tab (Ctrl+T)").clicked() {
+                        pages.push(PageTab::new(Page::Launcher, false));
+                        self.cur = pages.len() - 1;
+                        self.focus_launcher = true;
+                    }
                 });
             });
         });
+        ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() - 1.0, egui::Stroke::new(1.0, t.line));
         if let Some(i) = close {
             pages.remove(i);
             if self.cur > i || self.cur >= pages.len() {
@@ -757,28 +895,29 @@ impl Ready {
         }
     }
 
-    /// Second tab row: the page's list plus the objects opened from it.
+    /// Second tab row: the page's list plus the objects opened from it, as pills.
     fn subtabs_ui(&mut self, ui: &mut Ui, pt: &mut PageTab) {
         if pt.subs.is_empty() {
             return;
         }
-        ui.separator();
-        let title = pt.title();
         let (mut close, mut keep_only) = (None, None);
+        ui.add_space(6.0);
         ui.scope(|ui| {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal().id_salt(("subtabs", self.kctx.id(), pt.id)).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(pt.active == 0, RichText::new(format!("☰ {title}")).strong()).clicked() {
+                    ui.add_space(8.0);
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if ui_kit::pill_tab(ui, Some(Icon::List), "List", pt.active == 0, false, false).0.clicked() {
                         pt.active = 0;
                     }
                     for (i, t) in pt.subs.iter().enumerate() {
-                        ui.separator();
-                        let r = ui.selectable_label(pt.active == i + 1, &t.title).on_hover_text("Middle-click to close");
+                        let (r, x) = ui_kit::pill_tab(ui, None, &t.title, pt.active == i + 1, true, true);
+                        let r = r.on_hover_text("Middle-click to close");
                         if r.clicked() {
                             pt.active = i + 1;
                         }
-                        if r.middle_clicked() || ui.small_button("×").clicked() {
+                        if r.middle_clicked() || x.is_some_and(|x| x.clicked()) {
                             close = Some(i);
                         }
                         r.context_menu(|ui| {
@@ -799,6 +938,7 @@ impl Ready {
                 });
             });
         });
+        ui.add_space(4.0);
         if let Some(i) = close {
             pt.subs.remove(i);
             if pt.active > i {
@@ -813,68 +953,185 @@ impl Ready {
         }
     }
 
-    /// Sidebar; returns (page, pin): a single click previews, a double-click keeps a tab.
-    fn nav(&mut self, ui: &mut Ui, out: &mut Out) -> Option<(Page, bool)> {
+    /// Sidebar: the cluster card, pages with object counts, and the namespace filter at the bottom.
+    /// Returns ((page, pin), namespace filter changed); a click previews a page, a double-click keeps it.
+    fn nav(&mut self, ui: &mut Ui, out: &mut Out) -> (Option<(Page, bool)>, bool) {
+        let t = ui_kit::tokens(ui);
         let mut goto = None;
-        ui.add_space(6.0);
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.kctx.name).strong());
+            ui.add_space(4.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(9), t.accent_soft);
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initials(&self.kctx.name), ui_kit::semibold(13.0), t.accent);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(egui::Label::new(RichText::new(&self.kctx.name).font(ui_kit::semibold(14.0)).color(t.text)).truncate());
+                ui.horizontal(|ui| {
+                    ui_kit::dot(ui, GREEN, 3.0);
+                    ui.add(egui::Label::new(RichText::new(format!("Connected · {}", self.version)).size(11.5).color(t.muted)).truncate());
+                });
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("⌨").on_hover_text("Open a terminal for this context").clicked() {
+                if ui_kit::icon_button(ui, Icon::Terminal, 30.0, "Open a terminal for this context").clicked() {
                     out.term(ui.ctx(), format!("Terminal {}", self.kctx.name), tabs::local_shell(&self.kctx), None);
                 }
             });
         });
-        ui.label(RichText::new(&self.version).weak().small());
-        ui.separator();
+        ui.add_space(10.0);
+        ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, t.line));
+        let mut ns_changed = false;
+        egui::Panel::bottom(egui::Id::new(("nav-ns", self.kctx.id()))).frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(2, 8))).show(ui, |ui| {
+            ns_changed = self.ns_picker(ui);
+        });
+
         let cur = self.pages.get(self.cur).map(|t| t.page.clone());
         let has = |g: &str, k: &str| self.kinds.iter().any(|x| x.is(g, k));
+        let counts = self.counts.lock().unwrap().clone();
+        // Pages that list a kind count it live; the rest come from the background counts.
+        let live: HashMap<(String, String), usize> = self
+            .pages
+            .iter()
+            .filter_map(|p| p.list.as_ref())
+            .filter_map(|l| {
+                let d = l.data.lock().unwrap();
+                d.synced.then(|| ((l.kind.ar.group.clone(), l.kind.ar.kind.clone()), d.rows.len()))
+            })
+            .collect();
+        let count = |g: &str, k: &str| {
+            let key = (g.to_string(), k.to_string());
+            live.get(&key).or(counts.get(&key)).map(|n| n.to_string())
+        };
+        let warnings = self.warnings.as_ref().map_or(0, |l| l.grouped_len());
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            let mut item = |ui: &mut Ui, text: &str, p: Page| {
-                let r = ui.selectable_label(cur.as_ref() == Some(&p), text).on_hover_text("Click: preview · double-click: open as a tab");
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let mut item = |ui: &mut Ui, icon: Option<Icon>, text: &str, n: Option<String>, p: Page, indent: f32| {
+                let r = ui_kit::nav_item(ui, icon, text, n.as_deref(), cur.as_ref() == Some(&p), indent).on_hover_text("Click: preview · double-click: open as a tab");
                 if r.double_clicked() {
                     goto = Some((p, true));
                 } else if r.clicked() {
                     goto = Some((p, false));
                 }
+                r
             };
-            item(ui, "📊 Overview", Page::Overview);
+            item(ui, Some(Icon::Grid), "Overview", None, Page::Overview, 0.0);
             if has("", "Node") {
-                item(ui, "🖥 Nodes", kind_page("", "Node"));
+                item(ui, Some(Icon::Server), "Nodes", count("", "Node"), kind_page("", "Node"), 0.0);
             }
             if has("", "ConfigMap") || has("", "Secret") {
-                item(ui, "🔍 Search configs & secrets", Page::Search);
+                item(ui, Some(Icon::Search), "Search configs & secrets", None, Page::Search, 0.0);
             }
             for (section, entries) in NAV {
-                egui::CollapsingHeader::new(*section).default_open(*section == "Workloads").show(ui, |ui| {
+                if nav_section(ui, section, matches!(*section, "Workloads" | "Config" | "Network")) {
                     if *section == "Workloads" {
-                        item(ui, "Overview", Page::Workloads);
+                        item(ui, None, "Overview", None, Page::Workloads, 18.0);
                     }
                     for (g, k, text) in entries.iter().filter(|(g, k, _)| has(g, k)) {
-                        item(ui, text, kind_page(g, k));
+                        item(ui, None, text, count(g, k), kind_page(g, k), 18.0);
                     }
                     if *section == "Network" {
-                        item(ui, &format!("Port Forwarding ({})", self.forwards.len()), Page::Forwards);
+                        item(ui, None, "Port Forwarding", Some(self.forwards.len().to_string()), Page::Forwards, 18.0);
+                    }
+                }
+            }
+            if nav_section(ui, "Custom Resources", false) {
+                item(ui, None, "Definitions", None, kind_page("apiextensions.k8s.io", "CustomResourceDefinition"), 18.0);
+                for (group, kinds) in &self.custom {
+                    ui.horizontal(|ui| {
+                        ui.add_space(28.0);
+                        ui.label(RichText::new(group).size(11.5).color(t.dim));
+                    });
+                    for k in kinds {
+                        item(ui, None, &k.ar.kind, None, kind_page(group, &k.ar.kind), 28.0);
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, t.line));
+            ui.add_space(6.0);
+            item(ui, Some(Icon::Folder), "Namespaces", count("", "Namespace"), kind_page("", "Namespace"), 0.0);
+            let r = item(ui, Some(Icon::Activity), "Events", None, kind_page("", "Event"), 0.0);
+            if warnings > 0 {
+                ui_kit::badge(ui, egui::pos2(r.rect.right() - 8.0, r.rect.center().y), &warnings.to_string(), ORANGE);
+            }
+            if *HELM {
+                item(ui, Some(Icon::Wheel), "Helm releases", (!self.helm.rows.is_empty()).then(|| self.helm.rows.len().to_string()), Page::Helm, 0.0);
+            }
+            ui.add_space(8.0);
+        });
+        (goto, ns_changed)
+    }
+
+    /// A new tab: every view and resource kind, filtered by typing; Enter opens the first.
+    fn launcher_ui(&mut self, ui: &mut Ui, pt: &mut PageTab) -> Option<Page> {
+        let t = ui_kit::tokens(ui);
+        let has = |g: &str, k: &str| self.kinds.iter().any(|x| x.is(g, k));
+        let mut entries: Vec<(&str, String, Page)> = vec![("Cluster", "Overview".into(), Page::Overview)];
+        if has("", "Node") {
+            entries.push(("Cluster", "Nodes".into(), kind_page("", "Node")));
+        }
+        if has("", "ConfigMap") || has("", "Secret") {
+            entries.push(("Cluster", "Search configs & secrets".into(), Page::Search));
+        }
+        entries.push(("Cluster", "Namespaces".into(), kind_page("", "Namespace")));
+        entries.push(("Cluster", "Events".into(), kind_page("", "Event")));
+        if *HELM {
+            entries.push(("Cluster", "Helm releases".into(), Page::Helm));
+        }
+        entries.push(("Workloads", "Workloads overview".into(), Page::Workloads));
+        for (section, items) in NAV {
+            for (g, k, text) in items.iter().filter(|(g, k, _)| has(g, k)) {
+                entries.push((section, text.to_string(), kind_page(g, k)));
+            }
+        }
+        entries.push(("Network", "Port Forwarding".into(), Page::Forwards));
+        for (group, kinds) in &self.custom {
+            for k in kinds {
+                entries.push(("Custom resources", format!("{} · {group}", k.ar.kind), kind_page(group, &k.ar.kind)));
+            }
+        }
+        let q = pt.launch_query.trim().to_string();
+        entries.retain(|(sec, name, _)| q.is_empty() || contains_ci(name, &q) || contains_ci(sec, &q));
+
+        let mut pick = None;
+        let w = 520.0_f32.min(ui.available_width());
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+            ui.vertical(|ui| {
+                ui.set_width(w);
+                ui.label(RichText::new("New tab").font(ui_kit::semibold(22.0)).color(t.text));
+                ui.label(RichText::new("Open a view or a resource list here. Type to filter, Enter opens the first.").color(t.muted));
+                ui.add_space(10.0);
+                let r = ui_kit::search_field(ui, &mut pt.launch_query, "Pods, secrets, helm…", None, w);
+                if std::mem::take(&mut self.focus_launcher) {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    pick = entries.first().map(|e| e.2.clone());
+                }
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let mut last = "";
+                    for (sec, name, page) in &entries {
+                        if *sec != last {
+                            ui.add_space(8.0);
+                            ui_kit::section_label(ui, sec);
+                            last = sec;
+                        }
+                        if ui_kit::nav_item(ui, None, name, None, false, 6.0).clicked() {
+                            pick = Some(page.clone());
+                        }
+                    }
+                    if entries.is_empty() {
+                        ui.label(RichText::new("Nothing matches.").color(t.muted));
                     }
                 });
-            }
-            item(ui, "📂 Namespaces", kind_page("", "Namespace"));
-            item(ui, "🔔 Events", kind_page("", "Event"));
-            if *HELM {
-                item(ui, "⎈ Helm Releases", Page::Helm);
-            }
-            egui::CollapsingHeader::new("Custom Resources").show(ui, |ui| {
-                item(ui, "Definitions", kind_page("apiextensions.k8s.io", "CustomResourceDefinition"));
-                for (group, kinds) in &self.custom {
-                    egui::CollapsingHeader::new(group).id_salt(("crd-group", group)).show(ui, |ui| {
-                        for k in kinds {
-                            item(ui, &k.ar.kind, kind_page(group, &k.ar.kind));
-                        }
-                    });
-                }
             });
         });
-        goto
+        pick
     }
 
     /// Search inside Config Maps and Secrets; true when the namespace filter changed.
@@ -957,40 +1214,73 @@ impl Ready {
             ui.label("This resource type is not available on this cluster.");
             return false;
         };
+        let t = ui_kit::tokens(ui);
         let mut ns_changed = false;
-        // Wraps instead of overflowing on narrow windows.
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(label(&kind));
-            let mut syncing = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label(&kind)).font(ui_kit::semibold(20.0)).color(t.text));
             if let Some(l) = &pt.list {
                 let d = l.data.lock().unwrap();
-                syncing = !d.synced && d.error.is_none();
-                // Fixed width: the namespace menu must not move while it is open.
-                let count = RichText::new(format!("{} / {}", l.view.len(), d.rows.len())).weak();
-                ui.add_sized([96.0, ui.spacing().interact_size.y], egui::Label::new(count));
+                let syncing = !d.synced && d.error.is_none();
+                let n = if l.view.len() == d.rows.len() { d.rows.len().to_string() } else { format!("{} / {}", l.view.len(), d.rows.len()) };
+                drop(d);
+                ui_kit::chip(ui, &n, ui_kit::mono(12.0));
+                if syncing {
+                    ui.spinner();
+                }
             }
-            if kind.namespaced {
-                ns_changed = self.ns_picker(ui);
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if kind.can("create") && ui_kit::button(ui, Btn::Primary, Some(Icon::Plus), "Create").on_hover_text("Create resource from YAML").clicked() {
+                    out.tab(Body::Yaml(Box::new(YamlTab::create(self.client.clone(), self.kinds.clone(), self.default_ns()))));
+                }
+                if ui_kit::button(ui, if self.wide { Btn::On } else { Btn::Normal }, None, "Wide").on_hover_text("Show extra columns (kubectl -o wide)").clicked() {
+                    self.wide = !self.wide;
+                }
+                if kind.namespaced {
+                    ns_changed = self.ns_picker(ui);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
             if let Some(l) = &mut pt.list {
-                let r = ui.add(egui::TextEdit::singleline(&mut l.search).hint_text("🔍 Filter… (Ctrl+F)").desired_width(200.0));
+                let r = ui_kit::search_field(ui, &mut l.search, "Filter by name, label or node", Some("Ctrl F"), 280.0);
                 if std::mem::take(&mut self.focus_filter) {
                     r.request_focus();
                 }
-                ui.toggle_value(&mut l.filter_re, ".*").on_hover_text("Filter with a regular expression");
+                if ui_kit::button(ui, if l.filter_re { Btn::On } else { Btn::Normal }, None, ".*").on_hover_text("Filter with a regular expression").clicked() {
+                    l.filter_re = !l.filter_re;
+                }
                 if let Some(e) = &l.filter_error {
                     ui.colored_label(RED, "invalid regex").on_hover_text(e);
                 }
             }
-            ui.toggle_value(&mut self.wide, "Wide").on_hover_text("Show extra columns (kubectl -o wide)");
-            if kind.can("create") && ui.button("➕ Create").on_hover_text("Create resource from YAML").clicked() {
-                out.tab(Body::Yaml(Box::new(YamlTab::create(self.client.clone(), self.kinds.clone(), self.default_ns()))));
-            }
-            if syncing {
-                ui.spinner();
+            ui.add_space(8.0);
+            // A selection swaps the status filter for its actions: same row, nothing jumps.
+            if !self.bulk_actions(ui, pt, acts) {
+                if let Some(l) = &mut pt.list {
+                    if let Some(counts) = l.status_counts() {
+                        let total: usize = counts.iter().map(|c| c.1).sum();
+                        egui::Frame::new().fill(t.chrome).stroke(egui::Stroke::new(1.0, t.line)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(2)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if ui_kit::segment(ui, &format!("All {total}"), None, l.status.is_none()).clicked() {
+                                    l.status = None;
+                                }
+                                for (b, n) in counts {
+                                    if n == 0 && l.status != Some(b) {
+                                        continue;
+                                    }
+                                    if ui_kit::segment(ui, &format!("{b} {n}"), Some(crate::list::bucket_color(b)), l.status == Some(b)).clicked() {
+                                        l.status = if l.status == Some(b) { None } else { Some(b) };
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
             }
         });
-        self.bulk_bar(ui, pt, acts);
+        ui.add_space(6.0);
         let Some(l) = &mut pt.list else { return ns_changed };
         if let Some(e) = l.data.lock().unwrap().visible_error() {
             let hint = if e.contains("forbidden") && kind.namespaced && self.ns_sel.is_empty() { " — try selecting a namespace" } else { "" };
@@ -1003,57 +1293,48 @@ impl Ready {
         ns_changed
     }
 
-    /// Actions on the selected rows.
-    fn bulk_bar(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>) {
-        let Some(l) = &mut pt.list else { return };
+    /// Actions on the selected rows (in place of the status filter); false when nothing is selected.
+    fn bulk_actions(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>) -> bool {
+        let Some(l) = &mut pt.list else { return false };
         let sel = l.selected();
-        // Always takes the same space: rows must not jump under the pointer when a selection starts.
         if sel.is_empty() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_height(ui.spacing().interact_size.y);
-                ui.label(RichText::new("Click shows details · double-click opens a tab · checkboxes, Ctrl/Shift+click or Ctrl+A select for bulk actions").weak());
-            });
-            return;
+            return false;
         }
         let kind = l.kind.clone();
         let targets: Vec<Target> = sel.iter().map(|r| Target { kind: kind.clone(), ns: r.namespace.clone(), name: r.name.clone() }).collect();
-        let mut clear = false;
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("{} selected", sel.len())).strong());
-                let mut act = |a: Act| acts.push((targets.clone(), a));
-                if details::has_logs(&kind) && ui.button("📜 Logs").on_hover_text("One tab, lines interleaved by time").clicked() {
-                    act(Act::Logs(None));
-                }
-                if details::can_restart(&kind) && ui.button("⟳ Restart").clicked() {
-                    act(Act::Restart);
-                }
-                if details::can_scale(&kind) {
-                    ui.menu_button("Scale ⏷", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut self.scale_to).range(0..=1000));
-                            if ui.button("Apply").clicked() {
-                                act(Act::Scale(self.scale_to));
-                                ui.close();
-                            }
-                        });
-                    });
-                }
-                if ui.button("✏ Edit YAML").clicked() {
-                    act(Act::Edit);
-                }
-                if ui.button("Copy names").clicked() {
-                    ui.ctx().copy_text(sel.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join("\n"));
-                }
-                if kind.can("delete") && ui.button(RichText::new("🗑 Delete").color(RED)).clicked() {
-                    act(Act::Delete);
-                }
-                clear = ui.button("× Clear").on_hover_text("Esc").clicked();
+        let t = ui_kit::tokens(ui);
+        ui.label(RichText::new(format!("{} selected", sel.len())).font(ui_kit::semibold(13.0)).color(t.text));
+        let mut act = |a: Act| acts.push((targets.clone(), a));
+        if details::has_logs(&kind) && ui_kit::button(ui, Btn::Normal, Some(Icon::Doc), "Logs").on_hover_text("One tab, lines interleaved by time").clicked() {
+            act(Act::Logs(None));
+        }
+        if details::can_restart(&kind) && ui_kit::button(ui, Btn::Normal, None, "Restart").clicked() {
+            act(Act::Restart);
+        }
+        if details::can_scale(&kind) {
+            ui.menu_button("Scale ⏷", |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.scale_to).range(0..=1000));
+                    if ui.button("Apply").clicked() {
+                        act(Act::Scale(self.scale_to));
+                        ui.close();
+                    }
+                });
             });
-        });
-        if clear {
+        }
+        if ui_kit::button(ui, Btn::Normal, Some(Icon::Edit), "Edit YAML").clicked() {
+            act(Act::Edit);
+        }
+        if ui_kit::button(ui, Btn::Normal, None, "Copy names").clicked() {
+            ui.ctx().copy_text(sel.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join("\n"));
+        }
+        if kind.can("delete") && ui_kit::button(ui, Btn::Danger, Some(Icon::Trash), "Delete").clicked() {
+            act(Act::Delete);
+        }
+        if ui_kit::button(ui, Btn::Ghost, Some(Icon::X), "Clear").on_hover_text("Esc").clicked() {
             l.sel.clear();
         }
+        true
     }
 
     fn pick(&mut self, ctx: &egui::Context, pt: &mut PageTab, kind: Kind, data: Shared, pick: Option<Pick>, acts: &mut Vec<(Vec<Target>, Act)>) {
@@ -1072,13 +1353,29 @@ impl Ready {
         }
     }
 
-    fn overview(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>) {
-        ui.horizontal(|ui| {
-            ui.heading(&self.kctx.name);
-            ui.label(RichText::new(format!("{} · {}", self.kctx.server, self.version)).weak());
-        });
-        ui.add_space(6.0);
-        {
+    /// Cluster overview: usage cards, nodes, the busiest pods and warning events.
+    /// Returns true when the namespace filter changed.
+    fn overview(&mut self, ui: &mut Ui, acts: &mut Vec<(Vec<Target>, Act)>) -> bool {
+        let t = ui_kit::tokens(ui);
+        let mut ns_changed = false;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&self.kctx.name).font(ui_kit::semibold(24.0)).color(t.text));
+                    let nodes = self.metrics.lock().unwrap().alloc.len();
+                    let nss = self.namespaces.lock().unwrap().rows.len();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} · {nodes} nodes · {nss} namespaces · {}", self.version, self.kctx.server)).color(t.muted));
+                        if self.has_metrics {
+                            ui_kit::dot(ui, GREEN, 3.0);
+                            ui.label(RichText::new("metrics-server live").color(t.muted));
+                        }
+                    });
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ns_changed = self.ns_picker(ui));
+            });
+            ui.add_space(14.0);
+
             let m = self.metrics.lock().unwrap();
             if let Some(e) = &m.error {
                 ui.colored_label(RED, e);
@@ -1093,57 +1390,133 @@ impl Ready {
             for v in m.nodes.values() {
                 u = (u.0 + v.0, u.1 + v.1);
             }
-            ui.columns(3, |cols| {
-                let bar = |ui: &mut Ui, title: &str, used: f64, total: f64, text: String| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.label(RichText::new(title).strong());
-                        let frac = if total > 0.0 { (used / total) as f32 } else { 0.0 };
-                        ui.add(egui::ProgressBar::new(frac).text(text).fill(if frac > 0.85 { RED } else { GREEN }.gamma_multiply(0.8)));
-                    });
-                };
+            let (warn_rows, warn_cols) = self.warnings.as_ref().map(|l| l.grouped_rows()).unwrap_or_default();
+            let col = |name: &str| warn_cols.iter().position(|c| c.name == name);
+            let cell = |r: &Row, i: Option<usize>| i.and_then(|i| r.cells.get(i)).cloned().unwrap_or_default();
+            let (reason_i, obj_i, msg_i, seen_i) = (col("Reason"), col("Object"), col("Message"), col("Last Seen"));
+            let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+            for (r, _) in &warn_rows {
+                *reasons.entry(cell(r, reason_i)).or_default() += 1;
+            }
+            let mut reasons: Vec<(String, usize)> = reasons.into_iter().collect();
+            reasons.sort_by(|x, y| y.1.cmp(&x.1));
+            let top_reasons = reasons.iter().take(3).map(|(r, n)| format!("{r} {n}")).collect::<Vec<_>>().join(" · ");
+
+            ui.columns(4, |c| {
                 if self.has_metrics {
-                    bar(&mut cols[0], "CPU", u.0, a.0, format!("{} / {} cores ({:.0}%)", fmt_cpu(u.0), fmt_cpu(a.0), 100.0 * u.0 / a.0.max(1e-9)));
-                    bar(&mut cols[1], "Memory", u.1, a.1, format!("{} / {} ({:.0}%)", fmt_bytes(u.1), fmt_bytes(a.1), 100.0 * u.1 / a.1.max(1.0)));
-                    bar(&mut cols[2], "Pods", m.pods.len() as f64, a.2, format!("{} / {}", m.pods.len(), a.2));
+                    let pct = |x: f64, y: f64| if y > 0.0 { (x / y) as f32 } else { 0.0 };
+                    stat_card(&mut c[0], "CPU", &format!("{:.0}%", 100.0 * pct(u.0, a.0)), &format!("{} of {} cores", fmt_cpu(u.0), fmt_cpu(a.0)), Some(pct(u.0, a.0)), &format!("Allocatable on {} nodes", m.alloc.len()), false);
+                    stat_card(&mut c[1], "Memory", &format!("{:.0}%", 100.0 * pct(u.1, a.1)), &format!("{} of {}", fmt_bytes(u.1), fmt_bytes(a.1)), Some(pct(u.1, a.1)), "Working set, all nodes", false);
+                    stat_card(&mut c[2], "Pods", &m.pods.len().to_string(), &format!("of {} capacity", a.2), Some(pct(m.pods.len() as f64, a.2)), "Pods reporting metrics", false);
                 } else {
-                    cols[0].label(format!("{} nodes · {} cores · {} memory allocatable", m.alloc.len(), fmt_cpu(a.0), fmt_bytes(a.1)));
-                    cols[1].label(RichText::new("metrics-server not available: usage is hidden").weak());
+                    stat_card(&mut c[0], "CPU", &fmt_cpu(a.0), "cores allocatable", None, "metrics-server not available", false);
+                    stat_card(&mut c[1], "Memory", &fmt_bytes(a.1), "allocatable", None, "metrics-server not available", false);
+                    stat_card(&mut c[2], "Pods", &format!("{}", a.2), "capacity", None, "Usage needs metrics-server", false);
                 }
+                let n = warn_rows.len();
+                stat_card(&mut c[3], "Warnings", &n.to_string(), if n == 1 { "active warning" } else { "active warnings" }, None, if top_reasons.is_empty() { "All quiet" } else { &top_reasons }, n > 0);
             });
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new(format!("Nodes ({})", m.alloc.len())).default_open(true).show(ui, |ui| {
-                egui::Grid::new("ov-nodes").num_columns(4).striped(true).spacing([16.0, 4.0]).show(ui, |ui| {
-                    for h in ["Node", "CPU", "Memory", "Pods (allocatable)"] {
-                        ui.label(RichText::new(h).weak());
-                    }
-                    ui.end_row();
-                    let mut names: Vec<&String> = m.alloc.keys().collect();
-                    names.sort();
-                    for n in names {
-                        let (a, u) = (m.alloc[n], m.nodes.get(n).copied());
-                        if ui.link(n).on_hover_text("Open node").clicked() {
-                            acts.push((vec![], Act::Open { group: String::new(), kind: "Node".into(), ns: String::new(), name: n.clone() }));
+            ui.add_space(16.0);
+
+            let right = (ui.available_width() * 0.36).clamp(320.0, 440.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width() - right - 16.0);
+                    ui_kit::card(ui, Some(&format!("Nodes · {}", m.alloc.len())), |ui| {
+                        egui::Grid::new("ov-nodes").num_columns(4).spacing([22.0, 10.0]).show(ui, |ui| {
+                            for h in ["NODE", "CPU", "MEMORY", "PODS"] {
+                                ui.label(RichText::new(h).font(ui_kit::semibold(11.0)).color(t.dim));
+                            }
+                            ui.end_row();
+                            let mut names: Vec<&String> = m.alloc.keys().collect();
+                            names.sort();
+                            for n in names {
+                                let (al, us) = (m.alloc[n], m.nodes.get(n).copied());
+                                if ui.link(RichText::new(n).font(ui_kit::mono(12.5))).on_hover_text("Open node").clicked() {
+                                    acts.push((vec![], Act::Open { group: String::new(), kind: "Node".into(), ns: String::new(), name: n.clone() }));
+                                }
+                                for (used, total) in [(us.map(|u| u.0), al.0), (us.map(|u| u.1), al.1)] {
+                                    ui.horizontal(|ui| match used {
+                                        Some(v) => {
+                                            let f = (v / total.max(1e-9)) as f32;
+                                            ui_kit::bar(ui, f, 90.0, if f > 0.85 { RED } else if f > 0.7 { ORANGE } else { t.accent });
+                                            ui.label(RichText::new(format!("{:.0}%", 100.0 * f)).font(ui_kit::mono(12.0)).color(t.muted));
+                                        }
+                                        None => {
+                                            ui.label(RichText::new("—").color(t.dim));
+                                        }
+                                    });
+                                }
+                                ui.label(RichText::new(format!("{}", al.2)).font(ui_kit::mono(12.0)).color(t.muted));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    ui.add_space(16.0);
+                    let mut top: Vec<(&(String, String), &(f64, f64))> = m.pods.iter().collect();
+                    top.sort_by(|x, y| y.1.0.total_cmp(&x.1.0));
+                    let max = top.first().map_or(1.0, |p| p.1.0.max(1e-9));
+                    ui_kit::card(ui, Some("Top pods by CPU"), |ui| {
+                        if top.is_empty() {
+                            ui.label(RichText::new("No pod metrics yet.").color(t.muted));
                         }
-                        for (used, total, text) in [(u.map(|u| u.0), a.0, fmt_cpu(a.0)), (u.map(|u| u.1), a.1, fmt_bytes(a.1))] {
-                            match used {
-                                Some(v) => ui.add(egui::ProgressBar::new((v / total.max(1e-9)) as f32).desired_width(180.0).text(format!("{:.0}% of {text}", 100.0 * v / total.max(1e-9)))),
-                                None => ui.label(text),
-                            };
+                        egui::Grid::new("ov-top").num_columns(4).spacing([18.0, 8.0]).show(ui, |ui| {
+                            for ((ns, name), (cpu, _)) in top.into_iter().take(6) {
+                                if ui.link(RichText::new(name).font(ui_kit::mono(12.5))).on_hover_text("Open pod").clicked() {
+                                    acts.push((vec![], Act::Open { group: String::new(), kind: "Pod".into(), ns: ns.clone(), name: name.clone() }));
+                                }
+                                ui.label(RichText::new(ns).color(t.dim));
+                                ui_kit::bar(ui, (*cpu / max) as f32, 120.0, t.accent);
+                                ui.label(RichText::new(fmt_cpu(*cpu)).font(ui_kit::mono(12.0)).color(t.muted));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(right);
+                    ui_kit::card(ui, Some("Warning events"), |ui| {
+                        if warn_rows.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui_kit::icon(ui, Icon::Check, 15.0, GREEN);
+                                ui.label(RichText::new("No warning events").color(t.muted));
+                            });
                         }
-                        ui.label(format!("{}", a.2));
-                        ui.end_row();
-                    }
+                        for (i, (r, n)) in warn_rows.iter().take(8).enumerate() {
+                            if i > 0 {
+                                ui.add_space(4.0);
+                                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, t.line));
+                                ui.add_space(6.0);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(cell(r, reason_i)).font(ui_kit::semibold(12.5)).color(ui_kit::status_fg(ui, ORANGE)));
+                                if *n > 1 {
+                                    ui_kit::chip(ui, &format!("×{n}"), ui_kit::mono(11.0));
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(watch::date_cell(&cell(r, seen_i))).font(ui_kit::mono(11.5)).color(t.dim));
+                                });
+                            });
+                            let obj = cell(r, obj_i);
+                            if ui.link(RichText::new(&obj).font(ui_kit::mono(12.0))).clicked() {
+                                if let Some((k, name)) = obj.split_once('/') {
+                                    let kd = self.kinds.iter().find(|x| x.ar.group.is_empty() && x.ar.kind.eq_ignore_ascii_case(k)).or_else(|| self.kinds.iter().find(|x| x.ar.kind.eq_ignore_ascii_case(k)));
+                                    if let Some(kd) = kd {
+                                        acts.push((vec![], Act::Open { group: kd.ar.group.clone(), kind: kd.ar.kind.clone(), ns: r.namespace.clone(), name: name.to_string() }));
+                                    }
+                                }
+                            }
+                            ui.add(egui::Label::new(RichText::new(cell(r, msg_i)).size(12.5).color(t.muted)).wrap());
+                        }
+                        if warn_rows.len() > 8 {
+                            ui.label(RichText::new(format!("{} more under Events", warn_rows.len() - 8)).color(t.dim));
+                        }
+                    });
                 });
             });
-        }
-        ui.add_space(6.0);
-        ui.label(RichText::new("⚠ Warning events (identical ones grouped)").strong());
-        let m = self.metrics.lock().unwrap();
-        let picked = pt.events.as_mut().map(|l| (l.kind.clone(), l.data.clone(), l.table(ui, &m, false, &mut self.find)));
-        drop(m);
-        if let Some((kind, data, pick)) = picked {
-            self.pick(ui.ctx(), pt, kind, data, pick, acts);
-        }
+        });
+        ns_changed
     }
 
     /// Returns (page to show, namespace filter changed).
@@ -1515,6 +1888,14 @@ impl Ready {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avatar_initials() {
+        assert_eq!(initials("K8S-QA"), "QA");
+        assert_eq!(initials("rancher-desktop"), "RD");
+        assert_eq!(initials("prod"), "PR");
+        assert_eq!(initials("k3s"), "K3");
+    }
 
     #[test]
     fn sidebar_navigation() {

@@ -9,7 +9,8 @@ use kube::Client;
 use crate::details::{row_actions, Act};
 use crate::find::{self, Find, Matcher};
 use crate::ops::{fmt_bytes, fmt_cpu, Kind, Metrics};
-use crate::watch::{self, cell_color, cmp_cells, Bg, ListData, Row, Shared};
+use crate::ui_kit;
+use crate::watch::{self, cell_color, cmp_cells, Bg, ListData, Row, Shared, GREEN, ORANGE, RED};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DCol {
@@ -37,11 +38,13 @@ pub struct List {
     pub data: Shared,
     _watches: Vec<Bg>,
     pub view: Vec<Arc<Row>>,
-    key: Option<(u64, String, bool, Option<(DCol, bool)>, Option<std::time::Instant>)>,
+    key: Option<(u64, String, bool, Option<(DCol, bool)>, Option<std::time::Instant>, Option<&'static str>)>,
     pub search: String,
     /// The filter box is a regular expression.
     pub filter_re: bool,
     pub filter_error: Option<String>,
+    /// Pods: show only this status bucket (`pod_bucket`).
+    pub status: Option<&'static str>,
     pub sort: Option<(DCol, bool)>,
     /// Selected rows by uid (survives re-sorts and watch updates).
     pub sel: HashSet<String>,
@@ -50,6 +53,30 @@ pub struct List {
     groups: HashMap<String, usize>,
     find_rows: Vec<usize>,
     find_key: Option<(u64, String, bool, bool, usize)>,
+    /// (data rev, distinct events) for `grouped_len`.
+    grouped: std::cell::Cell<(u64, usize)>,
+}
+
+/// Status filter buckets for pods, in display order.
+pub const POD_BUCKETS: [&str; 4] = ["Running", "Pending", "Failing", "Completed"];
+
+/// Which bucket a pod's Status column falls in.
+pub fn pod_bucket(status: &str) -> &'static str {
+    match status {
+        "Running" => "Running",
+        "Completed" | "Succeeded" => "Completed",
+        s if s == "Pending" || s == "ContainerCreating" || s == "PodInitializing" || s == "Terminating" || s.starts_with("Init:") => "Pending",
+        _ => "Failing",
+    }
+}
+
+pub fn bucket_color(b: &str) -> egui::Color32 {
+    match b {
+        "Running" => GREEN,
+        "Pending" => ORANGE,
+        "Failing" => RED,
+        _ => egui::Color32::from_rgb(128, 136, 150),
+    }
 }
 
 fn usage(kind: &Kind, m: &Metrics, r: &Row) -> Option<(f64, f64)> {
@@ -88,7 +115,41 @@ impl List {
             .into_iter()
             .map(|ns| Bg::spawn(watch::run(client.clone(), kind.ar.clone(), ns, fields.map(String::from), data.clone(), ctx.clone())))
             .collect();
-        List { kind, data, _watches: watches, view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None }
+        List { kind, data, _watches: watches, view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None, status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default() }
+    }
+
+    fn is_pods(&self) -> bool {
+        self.kind.is("", "Pod")
+    }
+
+    /// Pods: how many rows fall in each status bucket.
+    pub fn status_counts(&self) -> Option<Vec<(&'static str, usize)>> {
+        if !self.is_pods() {
+            return None;
+        }
+        let d = self.data.lock().unwrap();
+        let i = d.cols.iter().position(|c| c.name == "Status")?;
+        Some(POD_BUCKETS.iter().map(|b| (*b, d.rows.values().filter(|r| pod_bucket(r.cells.get(i).map_or("", |s| s)) == *b).count())).collect())
+    }
+
+    /// Distinct events (repeats grouped), cached per data revision.
+    pub fn grouped_len(&self) -> usize {
+        let d = self.data.lock().unwrap();
+        let (rev, n) = self.grouped.get();
+        if rev == d.rev && rev != 0 {
+            return n;
+        }
+        let n = group_events(d.rows.values().cloned().collect(), &d.cols).0.len();
+        self.grouped.set((d.rev, n));
+        n
+    }
+
+    /// Events grouped, newest first, with how many identical events each stands for.
+    pub fn grouped_rows(&self) -> (Vec<(Arc<Row>, usize)>, Vec<watch::Col>) {
+        let d = self.data.lock().unwrap();
+        let (mut rows, groups) = group_events(d.rows.values().cloned().collect(), &d.cols);
+        rows.sort_by_key(|r| std::cmp::Reverse(r.rv.parse::<u64>().unwrap_or(0)));
+        (rows.into_iter().map(|r| { let n = groups.get(&r.uid).copied().unwrap_or(1); (r, n) }).collect(), d.cols.clone())
     }
 
     /// Selected rows in view order.
@@ -154,7 +215,7 @@ impl List {
     }
 
     fn refresh(&mut self, d: &ListData, m: &Metrics) {
-        let key = Some((d.rev, self.search.clone(), self.filter_re, self.sort, m.at));
+        let key = Some((d.rev, self.search.clone(), self.filter_re, self.sort, m.at, self.status));
         if key == self.key {
             return;
         }
@@ -167,7 +228,14 @@ impl List {
         };
         self.filter_error = filt.as_ref().err().cloned();
         let filt = filt.unwrap_or(None);
-        let rows: Vec<Arc<Row>> = d.rows.values().filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name) || f.hit(&r.namespace) || r.cells.iter().any(|c| f.hit(c)))).cloned().collect();
+        let status_col = self.status.filter(|_| self.is_pods()).and_then(|b| d.cols.iter().position(|c| c.name == "Status").map(|i| (i, b)));
+        let rows: Vec<Arc<Row>> = d
+            .rows
+            .values()
+            .filter(|r| status_col.is_none_or(|(i, b)| pod_bucket(r.cells.get(i).map_or("", |s| s)) == b))
+            .filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name) || f.hit(&r.namespace) || r.cells.iter().any(|c| f.hit(c))))
+            .cloned()
+            .collect();
         (self.view, self.groups) = if is_event(kind) { group_events(rows, &d.cols) } else { (rows, HashMap::new()) };
         match self.sort {
             // Events: newest activity first (resourceVersion grows with every update).
@@ -252,7 +320,10 @@ impl List {
 
         let mut picked = None;
         let (mut clicked, mut toggled, mut all) = (None, None, None);
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        let row_h = ui.spacing().interact_size.y + 6.0; // 30 px comfortable, 26 compact
+        let tk = ui_kit::tokens(ui);
+        let pods = self.is_pods();
+        let status_i = cols.iter().find(|(_, n)| n == "Status").and_then(|(c, _)| if let DCol::Cell(i) = c { Some(*i) } else { None });
         let id = ("table", self.kind.ar.group.clone(), self.kind.ar.kind.clone(), wide, with_metrics);
         // Too many columns for the width (wide mode, narrow window) scroll sideways.
         egui::ScrollArea::horizontal().id_salt(&id).auto_shrink(false).show(ui, |ui| {
@@ -292,7 +363,8 @@ impl List {
                             Some((s, false)) if s == *c => " ⏷",
                             _ => "",
                         };
-                        if ui.add(egui::Button::new(RichText::new(format!("{name}{arrow}")).strong()).frame(false)).clicked() {
+                        let head = RichText::new(format!("{}{arrow}", name.to_uppercase())).font(ui_kit::semibold(11.0)).color(tk.dim).extra_letter_spacing(0.6);
+                        if ui.add(egui::Button::new(head).frame(false)).clicked() {
                             *sort = match *sort {
                                 Some((s, true)) if s == *c => Some((*c, false)),
                                 Some((s, false)) if s == *c => None,
@@ -316,15 +388,36 @@ impl List {
                     for (c, name) in &cols {
                         row.col(|ui| {
                             let text = self.cell_text(&r, *c, name, &types, m);
+                            let is_name = matches!(c, DCol::Cell(_)) && name == "Name";
+                            let status = matches!(c, DCol::Cell(_)).then(|| cell_color(name, &text)).flatten();
                             let mut rt = RichText::new(&text);
-                            if let Some(col) = matches!(c, DCol::Cell(_)).then(|| cell_color(name, &text)).flatten() {
-                                rt = rt.color(col);
+                            if let Some(col) = status {
+                                rt = rt.color(ui_kit::status_fg(ui, col));
+                            }
+                            if is_name {
+                                rt = rt.font(ui_kit::mono(12.5)).color(tk.text);
+                            }
+                            match c {
+                                DCol::Age | DCol::Cpu | DCol::Mem => rt = rt.font(ui_kit::mono(12.0)).color(tk.muted),
+                                DCol::Cell(_) if name == "Restarts" => {
+                                    let n: u32 = text.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                                    rt = rt.font(ui_kit::mono(12.0)).color(if n > 5 { ui_kit::status_fg(ui, RED) } else if n > 0 { ui_kit::status_fg(ui, ORANGE) } else { tk.muted });
+                                }
+                                _ => {}
                             }
                             if r.deleting {
                                 rt = rt.italics().weak();
                             }
+                            if is_name && pods {
+                                let b = status_i.and_then(|i| r.cells.get(i)).map_or("Running", |s| pod_bucket(s));
+                                ui_kit::dot(ui, bucket_color(b), 3.5);
+                            }
                             let hits = matcher.as_ref().map(|mt| mt.ranges(&text)).unwrap_or_default();
-                            if hits.is_empty() {
+                            if hits.is_empty() && !r.deleting && matches!(name.as_str(), "Status" | "Phase") && status.is_some() && !text.is_empty() {
+                                ui_kit::pill(ui, &text, status.unwrap_or(GREEN));
+                            } else if hits.is_empty() && *c == DCol::Ns && !text.is_empty() {
+                                ui_kit::chip(ui, &text, egui::FontId::proportional(12.0));
+                            } else if hits.is_empty() {
                                 ui.add(egui::Label::new(rt).truncate().selectable(false));
                             } else {
                                 let mut job = (*egui::WidgetText::from(rt).into_layout_job(ui.style(), egui::FontSelection::Default, egui::Align::Center)).clone();
@@ -395,7 +488,7 @@ mod tests {
         let kind = Kind { ar: kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&()), namespaced: true, verbs: vec![] };
         let mut l = List {
             kind, data: Default::default(), _watches: vec![], view: vec![], key: None, search: String::new(), filter_re: true, filter_error: None,
-            sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None,
+            status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
         };
         let mut d = ListData::default();
         for n in ["argocd-redis-ha-server-0", "argocd-redis-ha-haproxy-x", "argocd-server-1"] {
@@ -414,6 +507,13 @@ mod tests {
         l.refresh(&d, &m);
         assert_eq!(l.view.len(), 2);
         assert!(l.filter_error.is_none());
+    }
+
+    #[test]
+    fn pod_status_buckets() {
+        for (s, b) in [("Running", "Running"), ("Completed", "Completed"), ("Init:0/1", "Pending"), ("ContainerCreating", "Pending"), ("CrashLoopBackOff", "Failing"), ("ImagePullBackOff", "Failing"), ("Error", "Failing")] {
+            assert_eq!(pod_bucket(s), b, "{s}");
+        }
     }
 
     #[test]

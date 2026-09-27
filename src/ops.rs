@@ -413,6 +413,39 @@ async fn get_json(client: &Client, path: &str) -> anyhow::Result<Value> {
     Ok(client.request::<Value>(http::Request::get(path).body(vec![])?).await?)
 }
 
+/// Object counts for the sidebar, refreshed every minute. A `limit=1` list reads
+/// `remainingItemCount`, so counting stays cheap on big clusters; kinds that can't be counted
+/// that way (or that RBAC forbids) are left out.
+pub async fn count_loop(client: Client, kinds: Vec<Kind>, ns: Vec<String>, out: Arc<Mutex<HashMap<(String, String), usize>>>, ctx: egui::Context) {
+    loop {
+        for k in kinds.iter().filter(|k| k.can("list")) {
+            let scopes: Vec<String> = if k.namespaced && !ns.is_empty() { ns.clone() } else { vec![String::new()] };
+            let mut total = Some(0usize);
+            for scope in &scopes {
+                total = match api(&client, &k.ar, scope).list_metadata(&ListParams::default().limit(1)).await {
+                    Ok(l) => {
+                        let more = l.metadata.continue_.as_deref().is_some_and(|c| !c.is_empty());
+                        match l.metadata.remaining_item_count {
+                            Some(n) => total.map(|t| t + l.items.len() + n.max(0) as usize),
+                            None if !more => total.map(|t| t + l.items.len()),
+                            None => None, // the server didn't say how many remain
+                        }
+                    }
+                    Err(_) => None,
+                };
+                if total.is_none() {
+                    break;
+                }
+            }
+            if let Some(n) = total {
+                out.lock().unwrap().insert((k.ar.group.clone(), k.ar.kind.clone()), n);
+            }
+        }
+        ctx.request_repaint();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 /// Poll metrics-server (if present) and node allocatable every 30s.
 pub async fn metrics_loop(client: Client, has_metrics: bool, out: Arc<Mutex<Metrics>>, ctx: egui::Context) {
     loop {

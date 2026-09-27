@@ -1,7 +1,7 @@
 <!--
   KXS Watcher installer (WiX v4+ with the UI and Util extensions). Built by build_msi.ps1:
     wix build wix\main.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
-              -d Version=<x.y.z> -d ExePath=<release exe> -o <msi>
+              -d Version=<x.y.z> -d ExePath=<release exe> -d IconPath=<kxs.ico> -o <msi>
   Wizard: Welcome → Custom setup (install folder, Start menu / Desktop shortcuts) → Install → Finish
   (optionally launches the app). Per user by default, so no admin prompt for folders you can write to.
   Settings in %AppData%\KXS Watcher are left alone on install and uninstall.
@@ -21,6 +21,13 @@
     <SetProperty Id="REINSTALLMODE" Value="amus" Before="CostInitialize" Sequence="execute" Condition="Installed AND NOT REMOVE" />
     <MediaTemplate EmbedCab="yes" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Unnamed10110/KXS_Watcher" />
+    <!-- The icon build.rs draws (IconPath from build_msi.ps1): Installed apps and the shortcuts. -->
+    <Icon Id="KxsIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="KxsIcon.ico" />
+    <!-- Repair: running this MSI again (or Settings → Installed apps → Modify) opens Change / Repair / Remove.
+         Repair reinstalls every file and shortcut (REINSTALLMODE=amus above). ARPNOREPAIR / ARPNOMODIFY
+         stay unset so Windows offers both. -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="KXS Watcher" />
@@ -43,14 +50,14 @@
            [#KxsExe], because they are separate features (ICE69). -->
       <Feature Id="StartMenuShortcut" Title="Start menu shortcut" Description="KXS Watcher in the Start menu.">
         <Component Id="StartMenu" Directory="ProgramMenuFolder">
-          <Shortcut Id="StartMenuShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER"
+          <Shortcut Id="StartMenuShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER" Icon="KxsIcon.ico"
                     Description="Fast, lightweight Kubernetes / k3s manager" />
           <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
         </Component>
       </Feature>
       <Feature Id="DesktopShortcut" Title="Desktop shortcut" Description="KXS Watcher on the desktop.">
         <Component Id="Desktop" Directory="DesktopFolder">
-          <Shortcut Id="DesktopShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER"
+          <Shortcut Id="DesktopShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER" Icon="KxsIcon.ico"
                     Description="Fast, lightweight Kubernetes / k3s manager" />
           <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
         </Component>

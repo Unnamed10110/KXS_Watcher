@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::find::{self, Find};
 use crate::ops::{self, fmt_bytes, fmt_cpu, parse_qty, Ev, Kind, Metrics, Rel, Res};
+use crate::ui_kit::{self, Btn, Icon};
 use crate::watch::{self, cell_color, take, Pending, GREEN, ORANGE, RED};
 
 #[derive(Clone)]
@@ -168,8 +169,17 @@ fn group_events(evs: &[Ev]) -> Vec<Ev> {
     out
 }
 
+/// What an object tab shows (the details panel shows everything at once).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Section {
+    Overview,
+    Events,
+    Yaml,
+}
+
 pub struct Details {
     pub t: Target,
+    pub section: Section,
     rv: String,
     client: Client,
     obj: Option<Value>,
@@ -197,7 +207,7 @@ fn arr(v: &Value) -> impl Iterator<Item = &Value> {
 }
 
 fn kv(ui: &mut Ui, k: &str, v: impl Into<RichText>) {
-    find::label(ui, RichText::new(k).weak());
+    find::label(ui, RichText::new(k).color(ui_kit::tokens(ui).dim));
     find::wrapped(ui, v);
     ui.end_row();
 }
@@ -228,7 +238,7 @@ fn kv_link(ui: &mut Ui, acts: &mut Vec<Act>, k: &str, group: &str, kind: &str, n
     if name.is_empty() {
         return;
     }
-    find::label(ui, RichText::new(k).weak());
+    find::label(ui, RichText::new(k).color(ui_kit::tokens(ui).dim));
     obj_link(ui, acts, group, kind, ns, name);
     ui.end_row();
 }
@@ -243,13 +253,51 @@ fn chip(ui: &mut Ui, text: &str, color: Option<Color32>) -> egui::Response {
 }
 
 fn section(ui: &mut Ui, title: &str) {
-    ui.add_space(8.0);
-    find::label(ui, RichText::new(title).strong().size(15.0));
-    ui.separator();
+    ui.add_space(14.0);
+    let dim = ui_kit::tokens(ui).dim;
+    find::label(ui, RichText::new(title.to_uppercase()).font(ui_kit::semibold(11.5)).color(dim).extra_letter_spacing(0.8));
+    ui.add_space(2.0);
 }
 
 fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
-    egui::Grid::new(id).num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, add);
+    egui::Grid::new(id).num_columns(2).spacing([16.0, 7.0]).min_col_width(110.0).show(ui, add);
+}
+
+/// Short status for the header.
+fn status_of(kind: &Kind, obj: &Value) -> Option<String> {
+    let st = &obj["status"];
+    if obj["metadata"]["deletionTimestamp"].is_string() {
+        return Some("Terminating".into());
+    }
+    let text = match (kind.ar.group.as_str(), kind.ar.kind.as_str()) {
+        ("", "Pod") => {
+            let cs = || arr(&st["containerStatuses"]);
+            let waiting = cs().find_map(|c| c["state"]["waiting"]["reason"].as_str());
+            let failed = cs().find_map(|c| c["state"]["terminated"]["reason"].as_str()).filter(|r| *r != "Completed");
+            waiting.or(failed).unwrap_or(s(&st["phase"])).to_string()
+        }
+        ("", "Node") => arr(&st["conditions"]).find(|c| s(&c["type"]) == "Ready").map_or("", |c| if s(&c["status"]) == "True" { "Ready" } else { "NotReady" }).to_string(),
+        ("apps", "Deployment" | "StatefulSet" | "ReplicaSet") => {
+            let (want, ready) = (obj["spec"]["replicas"].as_i64().unwrap_or(0), st["readyReplicas"].as_i64().unwrap_or(0));
+            if ready >= want { "Ready" } else { "Not ready" }.to_string()
+        }
+        _ => s(&st["phase"]).to_string(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// An action as a button: icons for the common ones, Delete in red.
+fn act_button(ui: &mut Ui, a: &Act) -> egui::Response {
+    let label = a.label();
+    // Labels start with a glyph ("📜 Logs"); the painted icons replace them.
+    let bare = label.split_once(' ').filter(|(g, _)| !g.chars().any(char::is_alphanumeric)).map_or(label.as_str(), |(_, rest)| rest);
+    match a {
+        Act::Edit => ui_kit::button(ui, Btn::Normal, Some(Icon::Edit), "Edit YAML"),
+        Act::Logs(_) => ui_kit::button(ui, Btn::Normal, Some(Icon::Doc), "Logs"),
+        Act::Shell(_) | Act::NodeShell => ui_kit::button(ui, Btn::Normal, Some(Icon::Terminal), "Terminal"),
+        Act::Delete => ui_kit::button(ui, Btn::Danger, Some(Icon::Trash), "Delete"),
+        _ => ui_kit::button(ui, Btn::Normal, None, bare),
+    }
 }
 
 fn conditions(ui: &mut Ui, v: &Value) {
@@ -331,6 +379,7 @@ impl Details {
     pub fn new(ctx: &egui::Context, client: Client, kind: Kind, ns: String, name: String) -> Self {
         let mut d = Details {
             t: Target { kind, ns, name },
+            section: Section::Overview,
             rv: String::new(),
             client,
             obj: None,
@@ -429,28 +478,78 @@ impl Details {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, metrics: &Metrics, acts: &mut Vec<Act>, find: &mut Find) {
+    /// `full`: an object tab (big header, Overview / Events / YAML); else the compact details panel.
+    pub fn ui(&mut self, ui: &mut Ui, metrics: &Metrics, acts: &mut Vec<Act>, find: &mut Find, full: bool) {
         self.poll(ui.ctx());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.t.kind.ar.kind).weak());
-            ui.label(RichText::new(&self.t.name).heading().strong());
-            if !self.t.ns.is_empty() {
-                ui.label(RichText::new(format!("in {}", self.t.ns)).weak());
+        let t = ui_kit::tokens(ui);
+        let status = self.obj.as_ref().and_then(|o| status_of(&self.t.kind, o));
+        let meta: Vec<String> = [
+            (!self.t.ns.is_empty()).then(|| self.t.ns.clone()),
+            self.obj.as_ref().and_then(|o| o["metadata"]["creationTimestamp"].as_str()).map(|c| format!("created {} ago", watch::date_cell(c))),
+            self.obj.as_ref().and_then(|o| o["spec"]["nodeName"].as_str()).map(|n| format!("on {n}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let actions = self.obj.as_ref().map(|o| self.bar_actions(o)).unwrap_or_default();
+        let status_line = |ui: &mut Ui| {
+            if let Some(st) = &status {
+                ui_kit::pill(ui, st, cell_color("Status", st).unwrap_or(t.muted));
             }
-        });
-        if self.gone {
-            ui.colored_label(RED, "This object no longer exists.");
-        }
-        if let Some(obj) = &self.obj {
+            ui.label(RichText::new(meta.join(" · ")).color(t.muted));
+        };
+        if full {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(crate::cluster::label(&self.t.kind)).color(t.muted));
+                if !self.t.ns.is_empty() {
+                    ui.label(RichText::new("/").color(t.dim));
+                    ui.label(RichText::new(&self.t.ns).color(t.muted));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&self.t.name).font(ui_kit::mono(20.0)).color(t.text));
+                ui.add_space(4.0);
+                status_line(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for a in actions.iter().rev() {
+                        if act_button(ui, a).clicked() {
+                            acts.push(a.clone());
+                        }
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            let n_events = match &self.events {
+                Some(Ok(e)) => format!("Events ({})", e.len()),
+                _ => "Events".into(),
+            };
+            ui.horizontal(|ui| {
+                ui.set_height(34.0);
+                for (sec, name) in [(Section::Overview, "Overview".to_string()), (Section::Events, n_events), (Section::Yaml, "YAML".into())] {
+                    if ui_kit::tab(ui, &name, self.section == sec, false, false).clicked() {
+                        self.section = sec;
+                    }
+                    ui.add_space(22.0);
+                }
+            });
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, t.line));
+            ui.add_space(4.0);
+        } else {
+            ui.label(RichText::new(&self.t.name).font(ui_kit::mono(15.0)).color(t.text));
+            ui.horizontal_wrapped(|ui| status_line(ui));
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                for a in self.bar_actions(obj) {
-                    if ui.button(a.label()).clicked() {
-                        acts.push(a);
+                for a in &actions {
+                    if act_button(ui, a).clicked() {
+                        acts.push(a.clone());
                     }
                 }
             });
+            ui.add_space(2.0);
         }
-        ui.separator();
+        if self.gone {
+            ui.colored_label(RED, "This object no longer exists.");
+        }
 
         find::begin(find);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -464,15 +563,26 @@ impl Details {
                 _ => {}
             }
             if let Some(obj) = self.obj.clone() {
-                self.body(ui, &obj, metrics, acts);
-                self.related_ui(ui, acts);
-                self.events_ui(ui);
-                let hit = find::matches(|| ops::to_yaml(&obj));
-                egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, |ui| {
+                let yaml = |ui: &mut Ui| {
                     let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
                     let job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
                     find::job(ui, job);
-                });
+                };
+                match (full, self.section) {
+                    (true, Section::Events) => self.events_ui(ui),
+                    (true, Section::Yaml) => yaml(ui),
+                    (true, Section::Overview) => {
+                        self.body(ui, &obj, metrics, acts);
+                        self.related_ui(ui, acts);
+                    }
+                    (false, _) => {
+                        self.body(ui, &obj, metrics, acts);
+                        self.related_ui(ui, acts);
+                        self.events_ui(ui);
+                        let hit = find::matches(|| ops::to_yaml(&obj));
+                        egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, yaml);
+                    }
+                }
             }
         });
         find::end(find);
@@ -979,8 +1089,9 @@ impl Details {
                 section(ui, &format!("Events ({})", evs.len()));
                 for e in evs.iter().take(50) {
                     ui.horizontal_wrapped(|ui| {
-                        find::label(ui, RichText::new(&e.reason).color(if e.kind == "Warning" { ORANGE } else { GREEN }));
-                        ui.label(RichText::new(format!("{} ago{}", e.age, if e.count > 1 { format!(" ×{}", e.count) } else { String::new() })).weak());
+                        let c = if e.kind == "Warning" { ORANGE } else { GREEN };
+                        find::label(ui, RichText::new(&e.reason).font(ui_kit::semibold(12.5)).color(ui_kit::status_fg(ui, c)));
+                        ui.label(RichText::new(format!("{} ago{}", e.age, if e.count > 1 { format!(" ×{}", e.count) } else { String::new() })).font(ui_kit::mono(11.5)).color(ui_kit::tokens(ui).dim));
                     });
                     find::wrapped(ui, &e.message);
                     ui.add_space(4.0);
