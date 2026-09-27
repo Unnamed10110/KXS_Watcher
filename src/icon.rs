@@ -1,7 +1,8 @@
-//! The app icon, drawn in code: a neon heptagon ring (cyan → purple → pink) around a watching eye,
-//! on a dark rounded tile. Used by the build script (the exe's .ico) and for the window icon, so
-//! this file only uses std.
-use std::f32::consts::{PI, TAU};
+//! The app icon, drawn in code: a seven-blade aperture (a lens, and the seven spokes of the
+//! Kubernetes helm) around a heptagonal opening with a neon pupil, on a dark rounded tile. Sizes up
+//! to 32 px get wider gaps, a larger opening and flat blades so they stay legible. Used by the build
+//! script (the exe's .ico) and for the window icon, so this file only uses std.
+use std::f32::consts::PI;
 
 type Rgb = [f32; 3];
 
@@ -12,10 +13,6 @@ fn hex(c: u32) -> Rgb {
 fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
-}
-
-fn add(a: Rgb, b: Rgb, k: f32) -> Rgb {
-    [(a[0] + b[0] * k).min(1.0), (a[1] + b[1] * k).min(1.0), (a[2] + b[2] * k).min(1.0)]
 }
 
 /// Coverage of a signed distance (negative inside), anti-aliased over `aa`.
@@ -32,63 +29,48 @@ fn sd_round_box(x: f32, y: f32, half: f32, r: f32) -> f32 {
     len(qx.max(0.0), qy.max(0.0)) + qx.max(qy).min(0.0) - r
 }
 
-/// Regular `n`-gon of circumradius `r`, a vertex at the top (Inigo Quilez's formula).
-fn sd_polygon(x: f32, y: f32, r: f32, n: u32) -> f32 {
-    let an = PI / n as f32;
-    let bn = x.atan2(y).rem_euclid(2.0 * an) - an;
-    let l = len(x, y);
-    let (mut px, mut py) = (l * bn.cos(), l * bn.sin().abs());
-    px -= r * an.cos();
-    py -= r * an.sin();
-    py += (-py).clamp(0.0, r * an.sin());
-    len(px, py) * px.signum()
-}
-
-/// `n`×`n` straight RGBA pixels.
+/// `n`×`n` straight RGBA pixels. Distances are in the design's 100-unit square, centered.
 pub fn render(n: u32) -> Vec<u8> {
-    let s = n as f32;
-    let aa = 1.5 / s;
-    let (cyan, purple, pink) = (hex(0x00e5ff), hex(0xb026ff), hex(0xff2bd6));
-    let ring_color = |t: f32| {
-        let t = t.rem_euclid(1.0) * 3.0;
-        match t as u32 {
-            0 => lerp(cyan, purple, t),
-            1 => lerp(purple, pink, t - 1.0),
-            _ => lerp(pink, cyan, t - 2.0),
-        }
-    };
-    // Lines stay at least about a pixel wide in the small sizes.
-    let (ring_w, outline_w) = (0.03_f32.max(0.9 / s), 0.013_f32.max(0.55 / s));
+    let px = 100.0 / n as f32;
+    let aa = 1.2 * px;
+    let small = n <= 32;
+    let (tile, accent, white) = (hex(0x0b0d12), hex(0x00e5ff), [1.0; 3]);
+    // Blades reach `outer`; the opening is a heptagon of circumradius `hole`, vertex at the top.
+    let (outer, hole, gap, pupil) = if small { (37.0, 16.0, 4.2, 6.2) } else { (35.0, 13.0, 1.8, 4.6) };
+    let shade: [f32; 7] = if small { [1.0; 7] } else { [1.0, 0.86, 0.74, 0.64, 0.56, 0.49, 0.43] };
+    let apothem = hole * (PI / 7.0).cos();
+    // Outward normal of each opening edge j (from vertex j to j + 1).
+    let normal: [(f32, f32); 7] = std::array::from_fn(|j| {
+        let a = (-90.0 + (j as f32 + 0.5) * 360.0 / 7.0_f32).to_radians();
+        (a.cos(), a.sin())
+    });
     let mut out = Vec::with_capacity((n * n * 4) as usize);
     for j in 0..n {
         for i in 0..n {
-            let (x, y) = ((i as f32 + 0.5) / s - 0.5, (j as f32 + 0.5) / s - 0.5);
-            let alpha = cover(sd_round_box(x, y, 0.47, 0.11), aa);
+            let (x, y) = ((i as f32 + 0.5) * px - 50.0, (j as f32 + 0.5) * px - 50.0);
+            let d_tile = sd_round_box(x, y, 46.0, 21.0);
+            let alpha = cover(d_tile, aa);
             if alpha <= 0.0 {
                 out.extend([0, 0, 0, 0]);
                 continue;
             }
+            // Tile with a faint edge so it holds on a dark taskbar.
+            let mut c = lerp(tile, white, 0.07 * cover((d_tile + 0.5).abs() - 0.5, aa));
             let r = len(x, y);
-            // Tile: deep navy to black, darker at the rim.
-            let mut c = lerp(hex(0x1b2142), hex(0x06070c), y + 0.5);
-            c = lerp(c, hex(0x040509), (r / 0.72) * 0.5);
-            // Neon heptagon ring with its glow.
-            let rc = ring_color(x.atan2(-y) / TAU);
-            let d_ring = sd_polygon(x, y, 0.36, 7).abs() - ring_w;
-            c = add(c, rc, (-d_ring.max(0.0) / 0.05).exp() * 0.5);
-            c = lerp(c, rc, cover(d_ring, aa));
-            // The eye: a lens (two circles), outlined, with a glowing iris and a dark pupil.
-            let (lr, lc) = (0.26, 0.155);
-            let d_lens = (len(x, y - lc) - lr).max(len(x, y + lc) - lr);
-            let inside = cover(d_lens, aa);
-            c = lerp(c, hex(0x080a14), inside);
-            c = lerp(c, lerp(hex(0xc8f9ff), rc, 0.3), cover(d_lens.abs() - outline_w, aa));
-            let iris = lerp(cyan, purple, (x + y) * 4.0 + 0.5);
-            let d_iris = r - 0.085;
-            c = add(c, iris, (-d_iris.max(0.0) / 0.03).exp() * 0.3 * inside);
-            c = lerp(c, iris, cover(d_iris, aa) * inside);
-            c = lerp(c, hex(0x04050a), cover(r - 0.037, aa));
-            c = lerp(c, [1.0, 1.0, 1.0], cover(len(x + 0.029, y + 0.03) - 0.015_f32.max(0.5 / s), aa) * 0.95);
+            if !small {
+                c = lerp(c, accent, 0.32 * cover((r - 39.5).abs() - 0.7, aa)); // lens barrel
+            }
+            // Past edge k + 1 but not past edge k: blade k (each edge extended to the rim splits
+            // the ring into seven blades); the gap is cut from every side.
+            let side: [f32; 7] = std::array::from_fn(|k| x * normal[k].0 + y * normal[k].1 - apothem);
+            for k in 0..7 {
+                let d = side[k].max(-side[(k + 1) % 7]).max(r - outer) + gap / 2.0;
+                c = lerp(c, accent, shade[k] * cover(d, aa));
+            }
+            c = lerp(c, accent, cover(r - pupil, aa));
+            if !small {
+                c = lerp(c, white, 0.9 * cover(len(x + 1.8, y + 1.9) - 1.5, aa)); // glint
+            }
             let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             out.extend([byte(c[0]), byte(c[1]), byte(c[2]), byte(alpha)]);
         }
@@ -148,6 +130,17 @@ mod tests {
         assert_eq!(px.len(), 64 * 64 * 4);
         assert_eq!(px[3], 0); // top-left corner outside the rounded tile
         assert_eq!(px[(32 * 64 + 32) * 4 + 3], 255); // the center is opaque
+    }
+
+    #[test]
+    fn pupil_sits_in_a_dark_opening() {
+        // (size, a pixel between the pupil and the blades), in both the small and the full design
+        for (n, y) in [(16u32, 6u32), (64, 26)] {
+            let px = render(n);
+            let green = |x: u32, y: u32| px[((y * n + x) * 4 + 1) as usize];
+            assert!(green(n / 2, n / 2) > 150, "cyan pupil at {n} px"); // at 16 px it spans four pixels
+            assert!(green(n / 2, y) < 40, "dark opening at {n} px");
+        }
     }
 
     #[test]
