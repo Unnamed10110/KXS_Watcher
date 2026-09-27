@@ -12,13 +12,15 @@ use crate::ops::{fmt_bytes, fmt_cpu, Kind, Metrics};
 use crate::ui_kit;
 use crate::watch::{self, cell_color, cmp_cells, Bg, ListData, Row, Shared, GREEN, ORANGE, RED};
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DCol {
     Cell(usize),
     Ns,
     Age,
     Cpu,
     Mem,
+    /// Container images (registry/repo:tag): pods from their object, workloads from their "Images" column.
+    Images,
 }
 
 /// What the user did with rows this frame.
@@ -161,13 +163,25 @@ impl List {
         self.kind.is("", "Pod") || self.kind.is("", "Node")
     }
 
+    /// Kinds that show their image versions (always, not only in Wide).
+    fn has_images(&self, d: &ListData) -> bool {
+        self.is_pods() || d.cols.iter().any(|c| c.name == "Images")
+    }
+
     fn columns(&self, d: &ListData, wide: bool, metrics: bool) -> Vec<(DCol, String)> {
         let mut out = vec![];
+        let images = self.has_images(d);
         for (i, c) in d.cols.iter().enumerate() {
+            if c.name == "Images" {
+                continue; // shown as DCol::Images, before Age
+            }
             if c.priority > 0 && !wide {
                 continue;
             }
             if c.name == "Age" {
+                if images {
+                    out.push((DCol::Images, "Image".into()));
+                }
                 out.push((DCol::Age, "Age".into()));
                 continue;
             }
@@ -180,6 +194,9 @@ impl List {
                     out.extend([(DCol::Cpu, "CPU".into()), (DCol::Mem, "Memory".into())]);
                 }
             }
+        }
+        if images && !out.iter().any(|c| c.0 == DCol::Images) {
+            out.push((DCol::Images, "Image".into()));
         }
         if self.kind.namespaced && !out.iter().any(|c| c.0 == DCol::Ns) {
             out.insert(0, (DCol::Ns, "Namespace".into()));
@@ -209,9 +226,19 @@ impl List {
                 t
             }
             DCol::Ns => r.namespace.clone(),
+            DCol::Images => self.images_text(r),
             DCol::Age => watch::age(r.created),
             DCol::Cpu | DCol::Mem => self.usage_text(m, r, c == DCol::Cpu),
         }
+    }
+
+    /// Images of a row, comma-separated: the pod's own, or the workload's "Images" cell.
+    fn images_text(&self, r: &Row) -> String {
+        if !r.images.is_empty() {
+            return r.images.join(",");
+        }
+        let d = self.data.lock().unwrap();
+        d.cols.iter().position(|c| c.name == "Images").and_then(|i| r.cells.get(i)).cloned().unwrap_or_default()
     }
 
     fn refresh(&mut self, d: &ListData, m: &Metrics) {
@@ -233,7 +260,7 @@ impl List {
             .rows
             .values()
             .filter(|r| status_col.is_none_or(|(i, b)| pod_bucket(r.cells.get(i).map_or("", |s| s)) == b))
-            .filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name) || f.hit(&r.namespace) || r.cells.iter().any(|c| f.hit(c))))
+            .filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name) || f.hit(&r.namespace) || r.cells.iter().any(|c| f.hit(c)) || r.images.iter().any(|i| f.hit(i))))
             .cloned()
             .collect();
         (self.view, self.groups) = if is_event(kind) { group_events(rows, &d.cols) } else { (rows, HashMap::new()) };
@@ -246,6 +273,11 @@ impl List {
                     DCol::Cell(i) => cmp_cells(a.cells.get(i).map_or("", |s| s), b.cells.get(i).map_or("", |s| s)),
                     DCol::Ns => a.namespace.cmp(&b.namespace).then_with(|| a.name.cmp(&b.name)),
                     DCol::Age => b.created.cmp(&a.created),
+                    DCol::Images => a.images.join(",").cmp(&b.images.join(",")).then_with(|| {
+                        let i = d.cols.iter().position(|c| c.name == "Images");
+                        let cell = |r: &Row| i.and_then(|i| r.cells.get(i)).map_or("", |s| s.as_str()).to_string();
+                        cell(a).cmp(&cell(b))
+                    }),
                     DCol::Cpu | DCol::Mem => {
                         let f = |r: &Row| usage(kind, m, r).map(|u| if col == DCol::Cpu { u.0 } else { u.1 }).unwrap_or(-1.0);
                         f(a).total_cmp(&f(b))
@@ -344,6 +376,7 @@ impl List {
                     DCol::Cell(_) if name == "Message" => 420.0,
                     DCol::Ns => 130.0,
                     DCol::Cpu | DCol::Mem | DCol::Age => 70.0,
+                    DCol::Images => 230.0,
                     DCol::Cell(_) => 95.0,
                 };
                 tb = tb.column(if i + 1 == cols.len() { Column::remainder().at_least(w.min(120.0)) } else { Column::initial(w).at_least(40.0) }.clip(true));
@@ -413,7 +446,9 @@ impl List {
                                 ui_kit::dot(ui, bucket_color(b), 3.5);
                             }
                             let hits = matcher.as_ref().map(|mt| mt.ranges(&text)).unwrap_or_default();
-                            if hits.is_empty() && !r.deleting && matches!(name.as_str(), "Status" | "Phase") && status.is_some() && !text.is_empty() {
+                            if hits.is_empty() && *c == DCol::Images && !text.is_empty() {
+                                image_cell(ui, &text, tk.muted, tk.text);
+                            } else if hits.is_empty() && !r.deleting && matches!(name.as_str(), "Status" | "Phase") && status.is_some() && !text.is_empty() {
                                 ui_kit::pill(ui, &text, status.unwrap_or(GREEN));
                             } else if hits.is_empty() && *c == DCol::Ns && !text.is_empty() {
                                 ui_kit::chip(ui, &text, egui::FontId::proportional(12.0));
@@ -475,12 +510,37 @@ impl List {
     }
 }
 
+/// An image reference as (registry and path, name, :tag or @digest).
+fn split_image(image: &str) -> (&str, &str, &str) {
+    let slash = image.rfind('/').map_or(0, |i| i + 1);
+    let (path, rest) = image.split_at(slash);
+    let cut = rest.find('@').or_else(|| rest.rfind(':')).unwrap_or(rest.len());
+    let (name, tag) = rest.split_at(cut);
+    (path, name, tag)
+}
+
+/// Image cell: `name:tag` of the first image (the tag stands out), `+N` more; the full references
+/// with their registries on hover.
+fn image_cell(ui: &mut Ui, text: &str, muted: egui::Color32, strong: egui::Color32) {
+    let images: Vec<&str> = text.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let Some(first) = images.first() else { return };
+    let (_, name, tag) = split_image(first);
+    let mut job = egui::text::LayoutJob::default();
+    let font = ui_kit::mono(12.0);
+    job.append(name, 0.0, egui::TextFormat::simple(font.clone(), muted));
+    job.append(tag, 0.0, egui::TextFormat::simple(font.clone(), strong));
+    if images.len() > 1 {
+        job.append(&format!("  +{}", images.len() - 1), 0.0, egui::TextFormat::simple(font, muted));
+    }
+    ui.add(egui::Label::new(job).truncate().selectable(false)).on_hover_text(images.join("\n"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn row(uid: &str, rv: &str, cells: &[&str]) -> Arc<Row> {
-        Arc::new(Row { name: uid.into(), namespace: "default".into(), uid: uid.into(), rv: rv.into(), created: None, deleting: false, cells: cells.iter().map(|s| s.to_string()).collect() })
+        Arc::new(Row { name: uid.into(), namespace: "default".into(), uid: uid.into(), rv: rv.into(), created: None, deleting: false, cells: cells.iter().map(|s| s.to_string()).collect(), images: vec![] })
     }
 
     #[test]
@@ -507,6 +567,13 @@ mod tests {
         l.refresh(&d, &m);
         assert_eq!(l.view.len(), 2);
         assert!(l.filter_error.is_none());
+    }
+
+    #[test]
+    fn image_names_and_tags() {
+        assert_eq!(split_image("registry.example.com:5000/team/api-gateway:2.14.1"), ("registry.example.com:5000/team/", "api-gateway", ":2.14.1"));
+        assert_eq!(split_image("nginx"), ("", "nginx", ""));
+        assert_eq!(split_image("ghcr.io/x/app@sha256:abcd"), ("ghcr.io/x/", "app", "@sha256:abcd"));
     }
 
     #[test]

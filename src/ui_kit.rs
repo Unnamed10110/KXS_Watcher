@@ -361,7 +361,7 @@ pub fn tab(ui: &mut Ui, text: &str, current: bool, italic: bool, mono_: bool) ->
     if italic {
         rt = rt.italics();
     }
-    let r = ui.add(egui::Label::new(rt).sense(Sense::click()).selectable(false));
+    let r = ui.add(egui::Label::new(rt).sense(Sense::click_and_drag()).selectable(false));
     if current {
         let y = ui.max_rect().bottom() - 1.0;
         ui.painter().line_segment([Pos2::new(r.rect.left() - 10.0, y), Pos2::new(r.rect.right() + 26.0, y)], Stroke::new(2.0, t.accent));
@@ -464,7 +464,7 @@ pub fn pill_tab(ui: &mut Ui, icon_: Option<Icon>, text: &str, current: bool, mon
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
     let lead = if icon_.is_some() { 20.0 } else { 0.0 };
     let trail = if closable { 20.0 } else { 0.0 };
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 20.0, 26.0), Sense::click());
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 20.0, 26.0), Sense::click_and_drag());
     let (fill, stroke) = if current {
         (t.accent_soft, Stroke::new(1.0, mix(t.bg, t.accent, 0.5)))
     } else {
@@ -508,4 +508,56 @@ pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, kbd_: Option<&st
         .inner
     })
     .inner
+}
+
+/// Drag to reorder a row of tabs. `items` holds each tab's (rect, being dragged, drag just ended).
+/// While dragging, marks where the tab will land; when dropped, returns (from, to) for `move_item`.
+pub fn reorder(ui: &Ui, items: &[(Rect, bool, bool)]) -> Option<(usize, usize)> {
+    let from = items.iter().position(|i| i.1 || i.2)?;
+    let pos = ui.ctx().pointer_latest_pos()?;
+    let slot = items.iter().position(|i| pos.x < i.0.center().x).unwrap_or(items.len());
+    if slot == from || slot == from + 1 {
+        return None; // dropped where it was
+    }
+    let r = items[from].0;
+    let x = match items.get(slot) {
+        Some(i) => i.0.left() - 6.0,
+        None => items[items.len() - 1].0.right() + 6.0,
+    };
+    ui.painter().line_segment([Pos2::new(x, r.top() - 2.0), Pos2::new(x, r.bottom() + 2.0)], Stroke::new(2.0, tokens(ui).accent));
+    items[from].2.then_some((from, if slot > from { slot - 1 } else { slot }))
+}
+
+/// Moves `v[from]` to index `to`, keeping `cur` on the same item.
+pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize, cur: &mut usize) {
+    if from >= v.len() || to >= v.len() {
+        return;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    *cur = if *cur == from {
+        to
+    } else if from < *cur && to >= *cur {
+        *cur - 1
+    } else if from > *cur && to <= *cur {
+        *cur + 1
+    } else {
+        *cur
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moving_keeps_the_current_item() {
+        let (mut v, mut cur) = (vec!['a', 'b', 'c', 'd'], 1); // on 'b'
+        move_item(&mut v, 3, 0, &mut cur);
+        assert_eq!((v.iter().collect::<String>(), v[cur]), ("dabc".into(), 'b'));
+        move_item(&mut v, 2, 3, &mut cur); // 'b' itself moves right
+        assert_eq!((v.iter().collect::<String>(), v[cur]), ("dacb".into(), 'b'));
+        move_item(&mut v, 0, 1, &mut cur);
+        assert_eq!((v.iter().collect::<String>(), v[cur]), ("adcb".into(), 'b'));
+    }
 }

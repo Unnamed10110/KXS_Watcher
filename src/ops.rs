@@ -44,19 +44,30 @@ impl Kind {
 
 /// Every listable resource, preferred versions only. One broken aggregated API must not break the cluster.
 pub async fn discover(client: &Client) -> anyhow::Result<Vec<Kind>> {
-    let resources: Vec<_> = match Discovery::new(client.clone()).run_aggregated().await {
+    let aggregated: Vec<_> = match Discovery::new(client.clone()).run_aggregated().await {
         Ok(d) => d.groups().flat_map(|g| g.recommended_resources()).collect(),
-        Err(_) => {
-            let mut out = vec![];
-            let mut names = vec![String::new()];
-            names.extend(client.list_api_groups().await?.groups.into_iter().map(|g| g.name));
-            for n in names {
-                if let Ok(g) = kube::discovery::group(client, &n).await {
-                    out.extend(g.recommended_resources());
-                }
-            }
-            out
+        Err(_) => vec![],
+    };
+    // Aggregated discovery exists since Kubernetes 1.26; older servers (k3s v1.23…) answer with the
+    // plain lists, which parse as *no* resources. Without the core kinds, ask group by group.
+    let resources = if aggregated.iter().any(|(ar, _)| ar.group.is_empty() && ar.kind == "Pod") {
+        aggregated
+    } else {
+        let mut names = vec![String::new()];
+        names.extend(client.list_api_groups().await?.groups.into_iter().map(|g| g.name));
+        // All groups at once: one at a time takes seconds on a remote cluster.
+        let mut set = tokio::task::JoinSet::new();
+        for n in names {
+            let client = client.clone();
+            set.spawn(async move { kube::discovery::group(&client, &n).await.ok() });
         }
+        let mut out = vec![];
+        while let Some(done) = set.join_next().await {
+            if let Ok(Some(g)) = done {
+                out.extend(g.recommended_resources());
+            }
+        }
+        out
     };
     Ok(resources
         .into_iter()

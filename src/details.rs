@@ -170,7 +170,7 @@ fn group_events(evs: &[Ev]) -> Vec<Ev> {
 }
 
 /// What an object tab shows (the details panel shows everything at once).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Section {
     Overview,
     Events,
@@ -535,7 +535,7 @@ impl Details {
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, t.line));
             ui.add_space(4.0);
         } else {
-            ui.label(RichText::new(&self.t.name).font(ui_kit::mono(15.0)).color(t.text));
+            ui.add(egui::Label::new(RichText::new(&self.t.name).font(ui_kit::mono(15.0)).color(t.text)).truncate());
             ui.horizontal_wrapped(|ui| status_line(ui));
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -552,7 +552,9 @@ impl Details {
         }
 
         find::begin(find);
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        // Both directions: something wider than the panel scrolls instead of widening it (a
+        // side panel wider than the window disappears).
+        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             match (&self.obj, &self.error) {
                 (_, Some(e)) => {
                     ui.colored_label(RED, e);
@@ -565,7 +567,9 @@ impl Details {
             if let Some(obj) = self.obj.clone() {
                 let yaml = |ui: &mut Ui| {
                     let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-                    let job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
+                    let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
+                    // Wrapped: certificates and last-applied annotations are single lines thousands of pixels wide.
+                    job.wrap = egui::text::TextWrapping { max_width: ui.available_width(), ..Default::default() };
                     find::job(ui, job);
                 };
                 match (full, self.section) {

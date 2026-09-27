@@ -110,6 +110,10 @@ struct Settings {
     tabs: HashMap<String, cluster::SavedTabs>,
     /// Accent color per cluster (context id), handed out from `ACCENTS` on first use.
     accents: HashMap<String, Color32>,
+    /// Names given to clusters (tab rename), by context id.
+    aliases: HashMap<String, String>,
+    /// The cluster shown at exit (context id).
+    current: Option<String>,
 }
 
 /// Cluster colors, readable on dark and light themes. Rose is last, so red stays a deliberate pick (prod).
@@ -155,6 +159,8 @@ impl Default for Settings {
             node_shell_image: "busybox:1.36".into(),
             tabs: HashMap::new(),
             accents: HashMap::new(),
+            aliases: HashMap::new(),
+            current: None,
         }
     }
 }
@@ -188,6 +194,8 @@ struct App {
     term_hovered: bool,
     /// Custom accent window open for this context: (id, name).
     custom_accent: Option<(String, String)>,
+    /// A cluster tab being renamed: (context id, text, focus requested).
+    renaming: Option<(String, String, bool)>,
     /// Open file/folder dialog for kubeconfig sources.
     picking: Option<Pending<Vec<PathBuf>>>,
     /// Interface and monospace fonts in use.
@@ -308,6 +316,7 @@ impl App {
             settings_page: SettingsPage::Appearance,
             term_hovered: false,
             custom_accent: None,
+            renaming: None,
             picking: None,
             fonts,
             good_window: window.filter(|w| !bad_window(w)),
@@ -317,7 +326,7 @@ impl App {
                 app.open_cluster(&cc.egui_ctx, c);
             }
         }
-        app.cur = 0;
+        app.cur = app.clusters.iter().position(|t| t.cluster.is_some() && t.cluster == app.settings.current).unwrap_or(0);
         app
     }
 
@@ -450,7 +459,8 @@ impl App {
                 let fill = if is_open { mix(t.bg, accent, 0.12) } else if r.hovered() { t.hover } else { Color32::TRANSPARENT };
                 ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
                 ui.painter().circle_filled(Pos2::new(rect.left() + 14.0, rect.center().y), 4.5, accent);
-                ui.painter().text(Pos2::new(rect.left() + 28.0, rect.top() + 13.0), Align2::LEFT_CENTER, &c.name, ui_kit::semibold(13.0), t.text);
+                let shown = self.settings.aliases.get(&c.id()).map_or(c.name.as_str(), String::as_str);
+                ui.painter().text(Pos2::new(rect.left() + 28.0, rect.top() + 13.0), Align2::LEFT_CENTER, shown, ui_kit::semibold(13.0), t.text);
                 ui.painter().text(Pos2::new(rect.left() + 28.0, rect.top() + 28.0), Align2::LEFT_CENTER, &c.server, FontId::proportional(11.5), t.dim);
                 if is_open {
                     ui.painter().text(Pos2::new(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, "open", FontId::proportional(11.5), t.muted);
@@ -545,6 +555,7 @@ impl App {
         let bar = ui.max_rect();
         let cur_accent = self.clusters.get(self.cur).and_then(|x| x.cluster.as_ref()).and_then(|id| self.settings.accents.get(id)).copied().unwrap_or(t.accent);
         let (mut select, mut close, mut recolor, mut custom) = (None, None, None, None);
+        let (mut moved, mut rename, mut unalias, mut renamed) = (None, None, None, false);
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.add_space(6.0);
@@ -554,17 +565,64 @@ impl App {
             let (sep, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
             ui.painter().rect_filled(sep, CornerRadius::ZERO, t.line_strong);
             ui.add_space(4.0);
+            let n = self.clusters.len();
+            let mut items = vec![];
             for (i, tab) in self.clusters.iter().enumerate() {
                 let Some(c) = Self::cluster_of(tab) else { continue };
-                let accent = self.settings.accents.get(&c.kctx.id()).copied().unwrap_or(t.accent);
-                let (main, x) = cluster_pill(ui, &c.kctx.name, accent, i == self.cur);
+                let id = c.kctx.id();
+                let accent = self.settings.accents.get(&id).copied().unwrap_or(t.accent);
+                if let Some((rid, text, focused)) = &mut self.renaming
+                    && *rid == id
+                {
+                    // Enter keeps the name, Esc the old one; empty goes back to the context name.
+                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(150.0).font(ui_kit::semibold(13.0)));
+                    if !std::mem::replace(focused, true) {
+                        r.request_focus();
+                    }
+                    items.push((r.rect, false, false));
+                    if r.lost_focus() {
+                        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            let name = text.trim();
+                            if name.is_empty() || name == c.kctx.name {
+                                self.settings.aliases.remove(&id);
+                            } else {
+                                self.settings.aliases.insert(id.clone(), name.to_string());
+                            }
+                        }
+                        renamed = true;
+                    }
+                    continue;
+                }
+                let label = self.settings.aliases.get(&id).cloned().unwrap_or_else(|| c.kctx.name.clone());
+                let (main, x) = cluster_pill(ui, &label, accent, i == self.cur);
+                items.push((main.rect, main.dragged(), main.drag_stopped()));
                 if main.clicked() {
                     select = Some(i);
+                }
+                if main.double_clicked() {
+                    rename = Some((id.clone(), label.clone()));
                 }
                 if x.clicked() || main.middle_clicked() {
                     close = Some(i);
                 }
                 main.context_menu(|ui| {
+                    if ui.button("Rename…").clicked() {
+                        rename = Some((id.clone(), label.clone()));
+                        ui.close();
+                    }
+                    if self.settings.aliases.contains_key(&id) && ui.button("Reset name").clicked() {
+                        unalias = Some(id.clone());
+                        ui.close();
+                    }
+                    if i > 0 && ui.button("Move left").clicked() {
+                        moved = Some((i, i - 1));
+                        ui.close();
+                    }
+                    if i + 1 < n && ui.button("Move right").clicked() {
+                        moved = Some((i, i + 1));
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.label(RichText::new("Cluster color").weak());
                     if let Some(col) = color_choices(ui, Some(accent)) {
                         recolor = Some((c.kctx.id(), col));
@@ -580,6 +638,9 @@ impl App {
                         ui.close();
                     }
                 });
+            }
+            if let Some(m) = ui_kit::reorder(ui, &items) {
+                moved = Some(m);
             }
             if ui_kit::icon_button(ui, Icon::Plus, 30.0, "Connect a cluster").clicked() {
                 self.show_catalog = !self.show_catalog;
@@ -630,6 +691,18 @@ impl App {
         }
         if let Some(i) = select {
             self.cur = i;
+        }
+        if renamed {
+            self.renaming = None;
+        }
+        if let Some((id, text)) = rename {
+            self.renaming = Some((id, text, false));
+        }
+        if let Some(id) = unalias {
+            self.settings.aliases.remove(&id);
+        }
+        if let Some((from, to)) = moved {
+            ui_kit::move_item(&mut self.clusters, from, to, &mut self.cur);
         }
         if let Some((id, col)) = recolor {
             self.settings.accents.insert(id, col);
@@ -894,7 +967,7 @@ fn cluster_pill(ui: &mut Ui, name: &str, accent: Color32, current: bool) -> (egu
     let font = if current { ui_kit::semibold(13.0) } else { FontId::proportional(13.0) };
     let fg = if current { t.text } else { t.muted };
     let galley = ui.painter().layout_no_wrap(name.to_owned(), font, fg);
-    let (rect, main) = ui.allocate_exact_size(vec2(galley.size().x + 50.0, 30.0), Sense::click());
+    let (rect, main) = ui.allocate_exact_size(vec2(galley.size().x + 50.0, 30.0), Sense::click_and_drag());
     let fill = if current { mix(t.chrome, accent, if t.neon { 0.1 } else { 0.16 }) } else if main.hovered() { t.hover } else { Color32::TRANSPARENT };
     let stroke = if current { Stroke::new(1.0, if t.neon { accent } else { mix(t.chrome, accent, 0.5) }) } else { Stroke::NONE };
     ui.painter().rect(rect, CornerRadius::same(8), fill, stroke, StrokeKind::Inside);
@@ -906,7 +979,7 @@ fn cluster_pill(ui: &mut Ui, name: &str, accent: Color32, current: bool) -> (egu
         ui.painter().rect_filled(xr, CornerRadius::same(5), t.tag);
     }
     ui_kit::paint_icon(ui, xr.shrink(5.0), Icon::X, if x.hovered() { t.text } else { t.dim });
-    (main.on_hover_text("Right-click for its color · middle-click to close"), x.on_hover_text(format!("Close {name}")))
+    (main.on_hover_text("Drag to move · double-click to rename · right-click for color · middle-click to close"), x.on_hover_text(format!("Close {name}")))
 }
 
 /// Soft and neon swatches, one row each; returns the color clicked.
@@ -1008,6 +1081,7 @@ impl eframe::App for App {
                         theme::tint(ui.visuals_mut(), c);
                     }
                     if let Body::Cluster(c) = &mut tab.body {
+                        c.alias = self.settings.aliases.get(&c.kctx.id()).cloned();
                         c.ui(ui, &mut out);
                     }
                     // Logs, terminals and editors opened from a cluster carry its color.
@@ -1038,9 +1112,9 @@ impl eframe::App for App {
             }
             w => self.good_window = w.or(self.good_window.take()),
         }
-        let mut open: Vec<String> = self.open_ids().into_iter().collect();
-        open.sort();
-        self.settings.open = open;
+        // Open clusters, in tab order, come back on the next start.
+        self.settings.open = self.clusters.iter().filter_map(Self::cluster_of).map(|c| c.kctx.id()).collect();
+        self.settings.current = self.clusters.get(self.cur).and_then(|t| t.cluster.clone());
         // Closed clusters keep their last tabs, so reopening one restores them too.
         for c in self.clusters.iter().filter_map(App::cluster_of) {
             if let Some(s) = c.saved() {

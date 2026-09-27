@@ -43,6 +43,14 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Themes**: Dark, Light, System, AMOLED in eight neon colors (cyan, red, green, purple, pink,
   blue, yellow, orange: pure black, only the accent lights up), Crimson, Forest, Ocean and Violet.
 - **Tabs**: Ctrl+T (or "+" after the page tabs) opens a new tab: type to pick a view or resource list.
+  Drag tabs (clusters, pages, objects) to reorder them; double-click a cluster or page tab to rename it
+  (right-click: rename, reset name, move left/right).
+- **Remembers the UI**: window, theme and sizes, open clusters in order and the one shown, their names and
+  colors, page and object tabs (names, order, Overview/Events/YAML), namespace filter, Wide, each list's
+  filter/regex/sort/status and its open details row, the Search query, panel and column widths.
+- **Image column** on pods and every workload (deployments, stateful/daemon/replica sets, jobs, cron jobs):
+  `name:version` of each container image, the full registry reference on hover.
+- **Older clusters** (k3s v1.23 and other Kubernetes before 1.26) are discovered group by group.
 - **Text selection like an editor**: double-click selects a whole IP, name, image or `key=value` label,
   double-click and drag extends by words, triple-click selects the line (a patched egui in `vendor/egui`).
 - **Accent color per cluster**: tab title, outline, frame and selections, also on the logs,

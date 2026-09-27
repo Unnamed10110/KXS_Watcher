@@ -162,6 +162,8 @@ async fn connect(k: Ctx) -> Res<Conn> {
 
 pub struct ClusterTab {
     pub kctx: Ctx,
+    /// Name given to the cluster (tab rename); the context name when `None`.
+    pub alias: Option<String>,
     conn: Option<Pending<Res<Conn>>>,
     error: Option<String>,
     ready: Option<Box<Ready>>,
@@ -172,7 +174,7 @@ pub struct ClusterTab {
 impl ClusterTab {
     pub fn new(ctx: &egui::Context, kctx: Ctx, restore: Option<SavedTabs>) -> Self {
         let conn = Some(Pending::spawn(ctx, connect(kctx.clone())));
-        ClusterTab { kctx, conn, error: None, ready: None, restore }
+        ClusterTab { kctx, alias: None, conn, error: None, ready: None, restore }
     }
 
     /// Open tabs to save; the pending restore while still connecting.
@@ -207,7 +209,10 @@ impl ClusterTab {
         if let Some(r) = &mut self.ready {
             let page = r.pages.get_mut(r.cur).filter(|p| p.active == 0);
             let on_list = page.as_ref().is_some_and(|p| matches!(p.page, Page::Kind(..)));
-            if page.as_ref().is_some_and(|p| p.page == Page::Launcher) {
+            let panel_open = page.as_ref().is_some_and(|p| p.panel.is_some());
+            if r.panel_hovered && panel_open {
+                r.panel_find.open(); // over the details panel: find in it (keys, values, YAML)
+            } else if page.as_ref().is_some_and(|p| p.page == Page::Launcher) {
                 r.focus_launcher = true;
             } else if let Some(cs) = page.and_then(|p| p.content.as_mut()) {
                 cs.focus = true; // the search page's own query box
@@ -227,6 +232,7 @@ impl ClusterTab {
             }
         }
         if let Some(r) = &mut self.ready {
+            r.alias = self.alias.clone();
             return r.ui(ui, out);
         }
         ui.vertical_centered(|ui| {
@@ -329,15 +335,38 @@ pub struct SavedTabs {
     pages: Vec<SavedPage>,
     cur: usize,
     ns: Vec<String>,
+    #[serde(default)]
+    wide: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SavedPage {
     page: Page,
     preview: bool,
+    /// Name given to the tab.
+    #[serde(default)]
+    name: Option<String>,
     /// Object tabs: (group, kind, namespace, name).
     objs: Vec<(String, String, String, String)>,
     active: usize,
+    /// What each object tab shows, in `objs` order.
+    #[serde(default)]
+    sections: Vec<details::Section>,
+    #[serde(default)]
+    view: SavedView,
+}
+
+/// A page's view: the list's filter, sort and pods status, and the row whose details are open;
+/// the Search page's query.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedView {
+    search: String,
+    re: bool,
+    sort: Option<(crate::list::DCol, bool)>,
+    status: Option<String>,
+    /// Details panel: (namespace, name).
+    panel: Option<(String, String)>,
 }
 
 /// A page tab (Pods, Deployments, Overview…) with its own list and the object tabs opened from it.
@@ -356,11 +385,38 @@ struct PageTab {
     content: Option<ContentSearch>,
     /// New tab: its filter.
     launch_query: String,
+    /// Name given to the tab (rename); the page's own title when `None`.
+    name: Option<String>,
+    /// Details panel open at exit: (namespace, name), shown once the list has loaded.
+    panel_restore: Option<(String, String)>,
 }
 
 impl PageTab {
     fn new(page: Page, preview: bool) -> Self {
-        PageTab { id: next_id(), page, preview, list: None, workloads: vec![], subs: vec![], active: 0, panel: None, content: None, launch_query: String::new() }
+        PageTab { id: next_id(), page, preview, list: None, workloads: vec![], subs: vec![], active: 0, panel: None, content: None, launch_query: String::new(), name: None, panel_restore: None }
+    }
+
+    fn view(&self) -> SavedView {
+        let mut v = SavedView::default();
+        if let Some(l) = &self.list {
+            (v.search, v.re, v.sort, v.status) = (l.search.clone(), l.filter_re, l.sort, l.status.map(String::from));
+            v.panel = self.panel.as_ref().map(|p| (p.details.t.ns.clone(), p.details.t.name.clone())).or_else(|| self.panel_restore.clone());
+        }
+        if let Some(c) = &self.content {
+            (v.search, v.re) = (c.find.query.clone(), c.find.regex);
+        }
+        v
+    }
+
+    fn set_view(&mut self, v: SavedView) {
+        if let Some(l) = &mut self.list {
+            (l.search, l.filter_re, l.sort) = (v.search.clone(), v.re, v.sort);
+            l.status = v.status.and_then(|s| crate::list::POD_BUCKETS.into_iter().find(|b| *b == s));
+            self.panel_restore = v.panel;
+        }
+        if let Some(c) = &mut self.content {
+            (c.find.query, c.find.regex) = (v.search, v.re);
+        }
     }
 
     /// (Re)start the watches this page needs; also after a namespace change.
@@ -393,6 +449,9 @@ impl PageTab {
     }
 
     fn title(&self) -> String {
+        if let Some(n) = &self.name {
+            return n.clone();
+        }
         match &self.page {
             Page::Overview => "Overview".into(),
             Page::Workloads => "Workloads".into(),
@@ -475,11 +534,17 @@ struct Ready {
     counts: Arc<Mutex<HashMap<(String, String), usize>>>,
     _counts_bg: Option<Bg>,
     panel_find: Find,
+    /// The pointer was over the details panel last frame: Ctrl+F / Ctrl+K find in it.
+    panel_hovered: bool,
     find: Find,
     /// Ctrl+F: focus the filter box next frame.
     focus_filter: bool,
     /// Focus the new tab's filter next frame.
     focus_launcher: bool,
+    /// A page tab being renamed: (tab id, text, focus requested).
+    renaming: Option<(u64, String, bool)>,
+    /// Name given to the cluster, shown in its sidebar card and overview.
+    alias: Option<String>,
     /// Node shells being started: (node, pending (namespace, pod)).
     node_shells: Vec<(String, Pending<Res<(String, String)>>)>,
     scale_to: i64,
@@ -525,9 +590,12 @@ impl Ready {
             counts: Default::default(),
             _counts_bg: None,
             panel_find: Find::default(),
+            panel_hovered: false,
             find: Find::default(),
             focus_filter: false,
             focus_launcher: false,
+            renaming: None,
+            alias: None,
             node_shells: vec![],
             scale_to: 1,
             metrics: Default::default(),
@@ -539,6 +607,7 @@ impl Ready {
         };
         if let Some(s) = restore {
             r.ns_sel = s.ns.into_iter().collect();
+            r.wide = s.wide;
             for sp in s.pages {
                 let gone = match &sp.page {
                     Page::Kind(g, k) => r.kind(g, k).is_none(),
@@ -549,9 +618,14 @@ impl Ready {
                     continue;
                 }
                 let mut t = r.new_page(ctx, sp.page, sp.preview);
-                for (g, k, ns, name) in sp.objs {
+                t.name = sp.name;
+                t.set_view(sp.view);
+                for (i, (g, k, ns, name)) in sp.objs.into_iter().enumerate() {
                     if let Some(kind) = r.kind(&g, &k) {
                         t.open_obj(ctx, &r.client, kind, ns, name, false);
+                        if let (Some(o), Some(s)) = (t.subs.last_mut(), sp.sections.get(i)) {
+                            o.details.section = *s;
+                        }
                     }
                 }
                 t.active = sp.active.min(t.subs.len());
@@ -585,11 +659,14 @@ impl Ready {
             .map(|t| SavedPage {
                 page: t.page.clone(),
                 preview: t.preview,
+                name: t.name.clone(),
                 active: t.active,
                 objs: t.subs.iter().map(|o| (o.details.t.kind.ar.group.clone(), o.details.t.kind.ar.kind.clone(), o.details.t.ns.clone(), o.details.t.name.clone())).collect(),
+                sections: t.subs.iter().map(|o| o.details.section).collect(),
+                view: t.view(),
             })
             .collect();
-        SavedTabs { pages, cur: self.cur, ns: self.ns_sel.iter().cloned().collect() }
+        SavedTabs { pages, cur: self.cur, ns: self.ns_sel.iter().cloned().collect(), wide: self.wide }
     }
 
     fn kind(&self, g: &str, k: &str) -> Option<Kind> {
@@ -801,6 +878,7 @@ impl Ready {
 
     /// Details of the clicked row, right of the list (only on the page view).
     fn panel_ui(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>) {
+        self.panel_hovered = false;
         if pt.active != 0 {
             return;
         }
@@ -809,16 +887,23 @@ impl Ready {
         let max = (ui.available_width() - 360.0).max(320.0);
         let t = ui_kit::tokens(ui);
         let frame = egui::Frame::new().fill(t.panel).inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 8 }).stroke(egui::Stroke::new(1.0, t.line));
-        egui::Panel::right(egui::Id::new(("details", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+        let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui_kit::section_label(ui, &p.details.t.kind.ar.kind);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     close = ui_kit::icon_button(ui, Icon::X, 26.0, "Close (Esc)").clicked();
+                    if ui_kit::icon_button(ui, Icon::Search, 26.0, "Find in these details (Ctrl+F with the pointer here)").clicked() {
+                        self.panel_find.open();
+                    }
                     to_tab = ui_kit::button(ui, Btn::Ghost, Some(Icon::External), "Open in tab").on_hover_text("Open in its own tab (double-click a row does the same)").clicked();
                 });
             });
+            // Finds in everything the panel shows: keys, values (hidden secret values count as
+            // "hidden matches" without being revealed), references, events and the YAML.
+            self.panel_find.bar(ui, |_| false);
             ui.push_id(p.id, |ui| p.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.panel_find, false));
         });
+        self.panel_hovered = ui.ctx().pointer_hover_pos().is_some_and(|pos| shown.response.rect.contains(pos));
         let t = p.details.t.clone();
         acts.extend(dacts.into_iter().map(|a| (vec![t.clone()], a)));
         if to_tab {
@@ -832,19 +917,45 @@ impl Ready {
     /// First tab row: one tab per page (Pods, Deployments…); the preview tab is in italics.
     fn page_tabs_ui(&mut self, ui: &mut Ui, pages: &mut Vec<PageTab>) {
         let (mut close, mut keep_only) = (None, None);
+        let (mut moved, mut rename, mut renamed) = (None, None, false);
         let t = ui_kit::tokens(ui);
+        let n = pages.len();
         ui.scope(|ui| {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal().id_salt(("pagetabs", self.kctx.id())).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.set_height(38.0);
                     ui.spacing_mut().item_spacing.x = 4.0;
+                    let mut items = vec![];
                     for (i, pt) in pages.iter_mut().enumerate() {
                         ui.add_space(if i == 0 { 10.0 } else { 18.0 });
-                        let tip = if pt.preview { "Preview: the next single click in the sidebar replaces it. Double-click to keep it." } else { "Middle-click to close" };
+                        if let Some((id, text, focused)) = &mut self.renaming
+                            && *id == pt.id
+                        {
+                            // Enter keeps the name, Esc keeps the old one; empty goes back to the default.
+                            let r = ui.add(egui::TextEdit::singleline(text).desired_width(160.0).font(ui_kit::semibold(13.0)));
+                            if !std::mem::replace(focused, true) {
+                                r.request_focus();
+                            }
+                            items.push((r.rect, false, false));
+                            if r.lost_focus() {
+                                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    let name = text.trim();
+                                    pt.name = (!name.is_empty()).then(|| name.to_string());
+                                }
+                                renamed = true;
+                            }
+                            continue;
+                        }
+                        let tip = if pt.preview { "Preview: the next single click in the sidebar replaces it. Double-click to keep it." } else { "Drag to move · double-click to rename · middle-click to close" };
                         let r = ui_kit::tab(ui, &pt.title(), i == self.cur, pt.preview, false).on_hover_text(tip);
+                        items.push((r.rect, r.dragged(), r.drag_stopped()));
                         if r.double_clicked() {
-                            pt.preview = false;
+                            if pt.preview {
+                                pt.preview = false;
+                            } else {
+                                rename = Some((pt.id, pt.title()));
+                            }
                         }
                         if r.clicked() {
                             self.cur = i;
@@ -853,6 +964,23 @@ impl Ready {
                             close = Some(i);
                         }
                         r.context_menu(|ui| {
+                            if ui.button("Rename…").clicked() {
+                                rename = Some((pt.id, pt.title()));
+                                ui.close();
+                            }
+                            if pt.name.is_some() && ui.button("Reset name").clicked() {
+                                pt.name = None;
+                                ui.close();
+                            }
+                            if i > 0 && ui.button("Move left").clicked() {
+                                moved = Some((i, i - 1));
+                                ui.close();
+                            }
+                            if i + 1 < n && ui.button("Move right").clicked() {
+                                moved = Some((i, i + 1));
+                                ui.close();
+                            }
+                            ui.separator();
                             if pt.preview && ui.button("Keep open").clicked() {
                                 pt.preview = false;
                                 ui.close();
@@ -871,6 +999,9 @@ impl Ready {
                             }
                         });
                     }
+                    if let Some(m) = ui_kit::reorder(ui, &items) {
+                        moved = Some(m);
+                    }
                     ui.add_space(10.0);
                     if ui_kit::icon_button(ui, Icon::Plus, 24.0, "New tab (Ctrl+T)").clicked() {
                         pages.push(PageTab::new(Page::Launcher, false));
@@ -881,6 +1012,15 @@ impl Ready {
             });
         });
         ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() - 1.0, egui::Stroke::new(1.0, t.line));
+        if renamed {
+            self.renaming = None;
+        }
+        if let Some((id, text)) = rename {
+            self.renaming = Some((id, text, false));
+        }
+        if let Some((from, to)) = moved {
+            ui_kit::move_item(pages, from, to, &mut self.cur);
+        }
         if let Some(i) = close {
             pages.remove(i);
             if self.cur > i || self.cur >= pages.len() {
@@ -900,7 +1040,7 @@ impl Ready {
         if pt.subs.is_empty() {
             return;
         }
-        let (mut close, mut keep_only) = (None, None);
+        let (mut close, mut keep_only, mut moved) = (None, None, None);
         ui.add_space(6.0);
         ui.scope(|ui| {
             ui.style_mut().always_scroll_the_only_direction = true;
@@ -911,9 +1051,12 @@ impl Ready {
                     if ui_kit::pill_tab(ui, Some(Icon::List), "List", pt.active == 0, false, false).0.clicked() {
                         pt.active = 0;
                     }
+                    let n = pt.subs.len();
+                    let mut items = vec![];
                     for (i, t) in pt.subs.iter().enumerate() {
                         let (r, x) = ui_kit::pill_tab(ui, None, &t.title, pt.active == i + 1, true, true);
-                        let r = r.on_hover_text("Middle-click to close");
+                        let r = r.on_hover_text("Drag to move · middle-click to close");
+                        items.push((r.rect, r.dragged(), r.drag_stopped()));
                         if r.clicked() {
                             pt.active = i + 1;
                         }
@@ -921,6 +1064,14 @@ impl Ready {
                             close = Some(i);
                         }
                         r.context_menu(|ui| {
+                            if i > 0 && ui.button("Move left").clicked() {
+                                moved = Some((i, i - 1));
+                                ui.close();
+                            }
+                            if i + 1 < n && ui.button("Move right").clicked() {
+                                moved = Some((i, i + 1));
+                                ui.close();
+                            }
                             if ui.button("Close").clicked() {
                                 close = Some(i);
                                 ui.close();
@@ -935,10 +1086,21 @@ impl Ready {
                             }
                         });
                     }
+                    if let Some(m) = ui_kit::reorder(ui, &items) {
+                        moved = Some(m);
+                    }
                 });
             });
         });
         ui.add_space(4.0);
+        if let Some((from, to)) = moved {
+            // `active` counts the list as 0; keep it on the same object tab.
+            let mut cur = pt.active.checked_sub(1).unwrap_or(usize::MAX);
+            ui_kit::move_item(&mut pt.subs, from, to, &mut cur);
+            if pt.active > 0 {
+                pt.active = cur + 1;
+            }
+        }
         if let Some(i) = close {
             pt.subs.remove(i);
             if pt.active > i {
@@ -966,7 +1128,7 @@ impl Ready {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initials(&self.kctx.name), ui_kit::semibold(13.0), t.accent);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
-                ui.add(egui::Label::new(RichText::new(&self.kctx.name).font(ui_kit::semibold(14.0)).color(t.text)).truncate());
+                ui.add(egui::Label::new(RichText::new(self.alias.as_deref().unwrap_or(&self.kctx.name)).font(ui_kit::semibold(14.0)).color(t.text)).truncate()).on_hover_text(&self.kctx.name);
                 ui.horizontal(|ui| {
                     ui_kit::dot(ui, GREEN, 3.0);
                     ui.add(egui::Label::new(RichText::new(format!("Connected · {}", self.version)).size(11.5).color(t.muted)).truncate());
@@ -1214,6 +1376,15 @@ impl Ready {
             ui.label("This resource type is not available on this cluster.");
             return false;
         };
+        if let Some(l) = &pt.list
+            && pt.panel_restore.is_some()
+            && l.data.lock().unwrap().synced
+        {
+            let (ns, name) = pt.panel_restore.take().unwrap_or_default();
+            let data = l.data.clone();
+            let row = data.lock().unwrap().rows.values().find(|r| r.namespace == ns && r.name == name).cloned();
+            self.pick(ui.ctx(), pt, kind.clone(), data, row.map(Pick::Show), acts);
+        }
         let t = ui_kit::tokens(ui);
         let mut ns_changed = false;
         ui.horizontal(|ui| {
@@ -1361,7 +1532,7 @@ impl Ready {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&self.kctx.name).font(ui_kit::semibold(24.0)).color(t.text));
+                    ui.label(RichText::new(self.alias.as_deref().unwrap_or(&self.kctx.name)).font(ui_kit::semibold(24.0)).color(t.text));
                     let nodes = self.metrics.lock().unwrap().alloc.len();
                     let nss = self.namespaces.lock().unwrap().rows.len();
                     ui.horizontal(|ui| {
@@ -1910,11 +2081,23 @@ mod tests {
     #[test]
     fn saved_tabs_round_trip() {
         let s = SavedTabs {
-            pages: vec![SavedPage { page: kind_page("", "Pod"), preview: false, objs: vec![("".into(), "Pod".into(), "default".into(), "web-1".into())], active: 1 }],
+            pages: vec![SavedPage {
+                page: kind_page("", "Pod"),
+                preview: false,
+                name: Some("web pods".into()),
+                objs: vec![("".into(), "Pod".into(), "default".into(), "web-1".into())],
+                active: 1,
+                sections: vec![details::Section::Yaml],
+                view: SavedView { search: "web".into(), re: true, sort: Some((crate::list::DCol::Cell(2), false)), status: Some("Running".into()), panel: Some(("default".into(), "web-2".into())) },
+            }],
             cur: 0,
             ns: vec!["default".into()],
+            wide: true,
         };
         assert_eq!(serde_json::from_str::<SavedTabs>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        // saves from before these fields still load
+        let old = r#"{"pages":[{"page":"Overview","preview":true,"objs":[],"active":0}],"cur":0,"ns":[]}"#;
+        assert_eq!(serde_json::from_str::<SavedTabs>(old).unwrap().pages[0].view, SavedView::default());
     }
 
     #[test]
@@ -1922,7 +2105,7 @@ mod tests {
         let mut d = ListData::default();
         d.cols = ["Name", "Ready"].map(|n| watch::Col { name: n.into(), ..Default::default() }).to_vec();
         for (i, ready) in ["1/1", "0/1", "2/2"].iter().enumerate() {
-            let r = Row { name: format!("d{i}"), namespace: "x".into(), uid: i.to_string(), rv: "1".into(), created: None, deleting: false, cells: vec![format!("d{i}"), ready.to_string()] };
+            let r = Row { name: format!("d{i}"), namespace: "x".into(), uid: i.to_string(), rv: "1".into(), created: None, deleting: false, cells: vec![format!("d{i}"), ready.to_string()], images: vec![] };
             d.rows.insert(r.uid.clone(), Arc::new(r));
         }
         assert_eq!(breakdown(&d), vec![("Ready".to_string(), 2), ("Not ready".to_string(), 1)]);

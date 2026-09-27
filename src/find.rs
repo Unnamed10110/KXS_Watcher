@@ -108,8 +108,10 @@ impl Find {
             return false;
         }
         let mut changed = false;
-        ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("🔍 Find…").desired_width(260.0));
+        // Wraps instead of widening a narrow side panel.
+        ui.horizontal_wrapped(|ui| {
+            let w = (ui.available_width() - 250.0).clamp(100.0, 260.0);
+            let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("🔍 Find…").desired_width(w));
             if std::mem::take(&mut self.focus) {
                 r.request_focus();
             }

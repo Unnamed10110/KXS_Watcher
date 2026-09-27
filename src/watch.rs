@@ -78,6 +78,8 @@ pub struct Row {
     pub created: Option<jiff::Timestamp>,
     pub deleting: bool,
     pub cells: Vec<String>,
+    /// Pods: the container images (`spec.containers[].image`), from the full object.
+    pub images: Vec<String>,
 }
 
 #[derive(Default)]
@@ -138,6 +140,21 @@ struct RawRow {
 struct Obj {
     #[serde(default)]
     metadata: Meta,
+    /// Only pods are listed with their full object; only their images are kept.
+    #[serde(default)]
+    spec: ObjSpec,
+}
+
+#[derive(Deserialize, Default)]
+struct ObjSpec {
+    #[serde(default)]
+    containers: Vec<ObjContainer>,
+}
+
+#[derive(Deserialize, Default)]
+struct ObjContainer {
+    #[serde(default)]
+    image: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -156,8 +173,10 @@ struct Meta {
 }
 
 impl Row {
-    fn new(m: Meta, cells: Vec<String>) -> Self {
+    fn new(o: Obj, cells: Vec<String>) -> Self {
+        let m = o.metadata;
         Row {
+            images: o.spec.containers.into_iter().map(|c| c.image).filter(|i| !i.is_empty()).collect(),
             uid: if m.uid.is_empty() { format!("{}/{}", m.namespace, m.name) } else { m.uid },
             name: m.name,
             namespace: m.namespace,
@@ -184,10 +203,10 @@ fn cell_text(v: &Value) -> String {
 /// Columns + rows of a list response (Table, or plain list fallback).
 fn parse_list(t: Table) -> (Vec<Col>, Vec<Row>, ListMeta) {
     if t.kind == "Table" {
-        let rows = t.rows.into_iter().map(|r| Row::new(r.object.metadata, r.cells.iter().map(cell_text).collect())).collect();
+        let rows = t.rows.into_iter().map(|r| Row::new(r.object, r.cells.iter().map(cell_text).collect())).collect();
         (t.column_definitions, rows, t.metadata)
     } else {
-        let rows = t.items.into_iter().map(|o| { let n = o.metadata.name.clone(); Row::new(o.metadata, vec![n, String::new()]) }).collect();
+        let rows = t.items.into_iter().map(|o| { let n = o.metadata.name.clone(); Row::new(o, vec![n, String::new()]) }).collect();
         (fallback_cols(), rows, t.metadata)
     }
 }
@@ -199,7 +218,7 @@ fn event_rows(obj: Value) -> anyhow::Result<Vec<Row>> {
     } else {
         let o: Obj = serde_json::from_value(obj)?;
         let n = o.metadata.name.clone();
-        Ok(vec![Row::new(o.metadata, vec![n, String::new()])])
+        Ok(vec![Row::new(o, vec![n, String::new()])])
     }
 }
 
@@ -223,12 +242,24 @@ fn accept_table(mut req: http::Request<Vec<u8>>) -> http::Request<Vec<u8>> {
     req
 }
 
+/// Table rows carrying the whole object, not just its metadata (pods: for their images).
+fn include_object(mut req: http::Request<Vec<u8>>) -> http::Request<Vec<u8>> {
+    let uri = req.uri().to_string();
+    let sep = if uri.contains('?') { '&' } else { '?' };
+    if let Ok(u) = format!("{uri}{sep}includeObject=Object").parse() {
+        *req.uri_mut() = u;
+    }
+    req
+}
+
 /// Keep `data` in sync with a list+watch of `ar` (optionally one namespace / field selector). Runs forever.
 pub async fn run(client: Client, ar: ApiResource, ns: Option<String>, fields: Option<String>, data: Shared, ctx: egui::Context) {
     let req = Request::new(DynamicObject::url_path(&ar, ns.as_deref()));
+    // Pods have no image column in their table: list them with the object to read it.
+    let full = ar.group.is_empty() && ar.kind == "Pod";
     let mut backoff = 1;
     loop {
-        match sync(&client, &req, ns.as_deref(), fields.as_deref(), &data, &ctx).await {
+        match sync(&client, &req, ns.as_deref(), fields.as_deref(), full, &data, &ctx).await {
             Ok(()) => backoff = 1, // 410 Gone: relist right away
             Err(e) => {
                 {
@@ -245,11 +276,12 @@ pub async fn run(client: Client, ar: ApiResource, ns: Option<String>, fields: Op
     }
 }
 
-async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&str>, data: &Shared, ctx: &egui::Context) -> anyhow::Result<()> {
+async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&str>, full: bool, data: &Shared, ctx: &egui::Context) -> anyhow::Result<()> {
+    let shape = |r: http::Request<Vec<u8>>| if full { include_object(accept_table(r)) } else { accept_table(r) };
     let (mut cols, mut rows, mut cont) = (Vec::new(), Vec::new(), None);
     let mut rv = loop {
         let lp = ListParams { limit: Some(500), continue_token: cont.take(), field_selector: fields.map(String::from), ..Default::default() };
-        let (c, r, meta) = parse_list(client.request::<Table>(accept_table(req.list(&lp)?)).await?);
+        let (c, r, meta) = parse_list(client.request::<Table>(shape(req.list(&lp)?)).await?);
         if cols.is_empty() {
             cols = c;
         }
@@ -282,7 +314,7 @@ async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&
     }
     loop {
         let wp = WatchParams { timeout: Some(290), bookmarks: false, field_selector: fields.map(String::from), ..Default::default() };
-        let mut lines = client.request_stream(accept_table(req.watch(&wp, &rv)?)).await?.lines();
+        let mut lines = client.request_stream(shape(req.watch(&wp, &rv)?)).await?.lines();
         loop {
             // Server closes the watch at 290s; silence beyond that means a dead connection.
             let line = match tokio::time::timeout(Duration::from_secs(330), lines.next()).await {
@@ -465,5 +497,14 @@ mod tests {
         assert_eq!(cell_color("Ready", "0/1"), Some(ORANGE));
         assert_eq!(cell_color("Ready", "1/1"), None);
         assert_eq!(cell_color("Name", "Failed"), None);
+    }
+
+    #[test]
+    fn pod_rows_keep_their_images() {
+        let t = serde_json::json!({"kind":"Table","metadata":{"resourceVersion":"7"},"columnDefinitions":[{"name":"Name","type":"string"}],
+            "rows":[{"cells":["web-1"],"object":{"kind":"Pod","metadata":{"name":"web-1","uid":"u1"},
+                "spec":{"containers":[{"name":"app","image":"ghcr.io/x/web:1.2.3"},{"name":"proxy","image":"envoy:v1.30"}]}}}]});
+        let (_, rows, _) = parse_list(serde_json::from_value(t).unwrap());
+        assert_eq!(rows[0].images, vec!["ghcr.io/x/web:1.2.3", "envoy:v1.30"]);
     }
 }
