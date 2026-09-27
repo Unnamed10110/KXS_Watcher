@@ -65,6 +65,8 @@ Needs WiX (`dotnet tool install --global wix`).
 .\publish_release.ps1                      # same, with the tag v<version from Cargo.toml>
 ```
 
-The MSI installs per user (no admin prompt) into `%LocalAppData%\Programs\KXS Watcher` with a Start
-menu entry. Its version is the x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
+The MSI is a wizard: pick the install folder (default `%LocalAppData%\Programs\KXS Watcher`, per user,
+no admin prompt), Start menu and Desktop shortcuts, and launch at the end. Any installed version is
+replaced (a clean install, downgrades too); running the same MSI again reinstalls it. Its version is the
+x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
 refuses uncommitted changes and a tag that already exists on another commit.

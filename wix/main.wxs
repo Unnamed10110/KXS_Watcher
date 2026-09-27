@@ -1,33 +1,74 @@
 <!--
-  KXS Watcher installer (WiX v4+). Built by build_msi.ps1:
-    wix build wix\main.wxs -arch x64 -d Version=<x.y.z> -d ExePath=<release exe> -o <msi>
-  Installs per user by default (no admin prompt): %LocalAppData%\Programs\KXS Watcher + a Start menu entry.
-  Settings in %AppData%\KXS Watcher are left alone on uninstall.
+  KXS Watcher installer (WiX v4+ with the UI and Util extensions). Built by build_msi.ps1:
+    wix build wix\main.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+              -d Version=<x.y.z> -d ExePath=<release exe> -o <msi>
+  Wizard: Welcome → Custom setup (install folder, Start menu / Desktop shortcuts) → Install → Finish
+  (optionally launches the app). Per user by default, so no admin prompt for folders you can write to.
+  Settings in %AppData%\KXS Watcher are left alone on install and uninstall.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <!-- UpgradeCode must never change: it is how a new version finds and replaces the old one. -->
   <Package Name="KXS Watcher" Manufacturer="KXS Watcher" Version="$(var.Version)"
            UpgradeCode="9C52747C-913E-44D8-BF27-FEEE687C4435" Scope="perUserOrMachine">
-    <!-- Same-version rebuilds replace each other too (handy while the version isn't bumped). -->
-    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- Clean install on every run:
+         - another build of any version (older, same or newer) is uninstalled first, then this one installed;
+         - running this same MSI again silently reinstalls every file (by default Windows only "reconfigures").
+           With the wizard, Repair does the same. -->
+    <MajorUpgrade AllowDowngrades="yes" Schedule="afterInstallValidate" />
+    <SetProperty Id="REINSTALL" Value="ALL" Before="CostInitialize" Sequence="execute" Condition="Installed AND NOT REMOVE AND NOT REINSTALL" />
+    <SetProperty Id="REINSTALLMODE" Value="amus" Before="CostInitialize" Sequence="execute" Condition="Installed AND NOT REMOVE" />
     <MediaTemplate EmbedCab="yes" />
-    <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/Unnamed10110/KXS_Watcher" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="KXS Watcher" />
     </StandardDirectory>
+    <!-- The folder picked last time is offered again on upgrades. -->
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch Id="PreviousInstallFolder" Root="HKCU" Key="Software\KXS Watcher" Name="InstallFolder" Type="raw" />
+    </Property>
 
-    <Feature Id="Main" Title="KXS Watcher">
+    <Feature Id="Main" Title="KXS Watcher" Description="The application. Select it and use Browse to change where it goes."
+             ConfigurableDirectory="INSTALLFOLDER" AllowAbsent="no" Display="expand">
       <Component Id="MainExe" Directory="INSTALLFOLDER">
         <File Id="KxsExe" Source="$(var.ExePath)" Name="kxs-watcher.exe" KeyPath="yes" />
       </Component>
-      <!-- Shortcuts need their own component keyed on an HKCU value (ICE43 / ICE57). -->
-      <Component Id="StartMenu" Directory="ProgramMenuFolder">
-        <Shortcut Id="StartMenuShortcut" Name="KXS Watcher" Target="[#KxsExe]" WorkingDirectory="INSTALLFOLDER"
-                  Description="Fast, lightweight Kubernetes / k3s manager" />
-        <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      <Component Id="RememberFolder" Directory="INSTALLFOLDER">
+        <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
       </Component>
+
+      <!-- Shortcuts: own components keyed on HKCU values (ICE43 / ICE57); they target the path, not
+           [#KxsExe], because they are separate features (ICE69). -->
+      <Feature Id="StartMenuShortcut" Title="Start menu shortcut" Description="KXS Watcher in the Start menu.">
+        <Component Id="StartMenu" Directory="ProgramMenuFolder">
+          <Shortcut Id="StartMenuShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER"
+                    Description="Fast, lightweight Kubernetes / k3s manager" />
+          <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Feature>
+      <Feature Id="DesktopShortcut" Title="Desktop shortcut" Description="KXS Watcher on the desktop.">
+        <Component Id="Desktop" Directory="DesktopFolder">
+          <Shortcut Id="DesktopShortcut" Name="KXS Watcher" Target="[INSTALLFOLDER]kxs-watcher.exe" WorkingDirectory="INSTALLFOLDER"
+                    Description="Fast, lightweight Kubernetes / k3s manager" />
+          <RegistryValue Root="HKCU" Key="Software\KXS Watcher" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Feature>
     </Feature>
+
+    <!-- Wizard without the license page (there is no license text): Welcome goes straight to Custom setup. -->
+    <ui:WixUI Id="WixUI_FeatureTree" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="CustomizeDlg" Order="99" Condition="NOT Installed" />
+      <Publish Dialog="CustomizeDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="99" Condition="NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND REMOVE &lt;&gt; &quot;ALL&quot;" />
+    </UI>
+
+    <!-- Finish page: "Launch KXS Watcher" (checked). -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch KXS Watcher" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#KxsExe]" />
+    <CustomAction Id="LaunchApp" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
   </Package>
 </Wix>

@@ -18,6 +18,16 @@ Set-Location $PSScriptRoot
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
     throw "WiX not found. Install it with: dotnet tool install --global wix"
 }
+# The wizard (UI) and the "launch after install" action (Util) come from WiX extensions of the same version.
+$wixVersion = (wix --version) -replace '\+.*$', ''
+$extensions = 'WixToolset.UI.wixext', 'WixToolset.Util.wixext'
+$have = wix extension list -g
+foreach ($e in $extensions) {
+    if (-not ($have -match "^$([regex]::Escape($e)) ")) {
+        wix extension add -g "$e/$wixVersion" | Out-Host
+        if ($LASTEXITCODE) { throw "cannot add WiX extension $e" }
+    }
+}
 
 $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
 if ($LASTEXITCODE) { throw "cargo metadata failed" }
@@ -36,7 +46,8 @@ $outDir = Join-Path $PSScriptRoot 'target\KXS-Watcher'
 New-Item -ItemType Directory -Force $outDir | Out-Null
 $msi = Join-Path $outDir "KXS-Watcher-$Version-x64.msi"
 
-wix build (Join-Path $PSScriptRoot 'wix\main.wxs') -arch x64 -d "Version=$Version" -d "ExePath=$exe" -pdbtype none -o $msi | Out-Host
+$ext = $extensions | ForEach-Object { '-ext', $_ }
+wix build (Join-Path $PSScriptRoot 'wix\main.wxs') -arch x64 @ext -d "Version=$Version" -d "ExePath=$exe" -pdbtype none -o $msi | Out-Host
 if ($LASTEXITCODE) { throw "wix build failed" }
 
 $mb = [math]::Round((Get-Item $msi).Length / 1MB, 1)
