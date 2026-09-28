@@ -89,3 +89,7 @@ replaced (a clean install, downgrades too). Running the same MSI again, or Setti
 KXS Watcher → Modify, opens Change / Repair / Remove; Repair reinstalls every file and shortcut. Its version is the
 x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
 refuses uncommitted changes and a tag that already exists on another commit.
+
+## Developed by:
+- unnamed10110 (trojan.v6@gmail.com)
+- Sergio Britos (sergiobritos10110@gmail.com)
