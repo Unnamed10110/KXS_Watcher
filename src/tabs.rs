@@ -1,6 +1,8 @@
 //! Dock tool tabs: pod logs, terminals (local shell / pod exec / drain) and the YAML editor.
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,7 +16,7 @@ use kube::api::{Api, ApiResource, LogParams};
 use kube::Client;
 use serde_json::Value;
 
-use crate::find::{self, Find};
+use crate::find::{self, Find, Matcher};
 use crate::kubeconfig::{self, Ctx};
 use crate::ops::{self, Kind, Res};
 use crate::watch::{take, Bg, Pending, GREEN, ORANGE, RED};
@@ -41,9 +43,9 @@ impl Line {
     }
 }
 
-/// Split the RFC3339Nano prefix (always requested) and strip ANSI escapes.
-fn parse_line(raw: &str, src: u16) -> Line {
-    let (ts, rest) = match raw.split_once(' ') {
+/// The RFC3339Nano prefix (always requested) and the rest of a raw line.
+fn split_ts(raw: &str) -> (Option<jiff::Timestamp>, &str) {
+    match raw.split_once(' ') {
         Some((a, b)) => match a.parse::<jiff::Timestamp>() {
             Ok(t) => (Some(t), b),
             Err(_) => (None, raw),
@@ -52,7 +54,12 @@ fn parse_line(raw: &str, src: u16) -> Line {
             Ok(t) => (Some(t), ""),
             Err(_) => (None, raw),
         },
-    };
+    }
+}
+
+/// Split the timestamp and strip ANSI escapes.
+fn parse_line(raw: &str, src: u16) -> Line {
+    let (ts, rest) = split_ts(raw);
     let (text, spans) = strip_ansi(rest);
     Line { ts, src, chars: text.chars().count() as u32, text, spans }
 }
@@ -279,21 +286,27 @@ fn parse_since(s: &str, now: &jiff::Zoned) -> Result<Option<jiff::Timestamp>, St
 
 /// Follow one container's log. Dropped connections (load balancers cut idle streams) are resumed
 /// from the last line's timestamp; the stream only ends when the API says so or the log stays shut.
-/// It starts at `from` (every line since then), else with the last `TAIL` lines.
-async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Option<jiff::Timestamp>, buf: Arc<Mutex<LogBuf>>, ctx: egui::Context) {
+/// It starts at `from` (every line since then), else with the last `TAIL` lines; a range with an
+/// end (`to`) is read once, like a previous container's log.
+#[allow(clippy::too_many_arguments)]
+async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Option<jiff::Timestamp>, to: Option<jiff::Timestamp>, buf: Arc<Mutex<LogBuf>>, ctx: egui::Context) {
     let api: Api<Pod> = Api::namespaced(client, &src.ns);
+    let fixed = previous || to.is_some();
     let (mut last, mut quiet, mut backoff) = (None::<jiff::Timestamp>, 0, 1);
     let result = loop {
         // sinceTime has whole-second precision: go back a second and drop what we already have.
         // ponytail: a not-yet-seen line with exactly the last timestamp would be skipped on resume.
         let since = last.and_then(|t| t.checked_sub(jiff::SignedDuration::from_secs(1)).ok()).or(from);
-        let tail = if last.is_none() && from.is_none() { Some(TAIL) } else { None };
-        let lp = LogParams { container: Some(src.container.clone()), follow: !previous, previous, timestamps: true, tail_lines: tail, since_time: since, ..Default::default() };
+        let tail = if last.is_none() && from.is_none() && to.is_none() { Some(TAIL) } else { None };
+        let lp = LogParams { container: Some(src.container.clone()), follow: !fixed, previous, timestamps: true, tail_lines: tail, since_time: since, ..Default::default() };
         let mut got = 0;
         let r: anyhow::Result<()> = async {
             let mut lines = api.log_stream(&src.pod, &lp).await?.lines();
             while let Some(line) = lines.next().await {
                 let line = parse_line(&line?, idx);
+                if line.ts.zip(to).is_some_and(|(t, end)| t > end) {
+                    break; // past the end of the range
+                }
                 if let (Some(l), Some(t)) = (last, line.ts) {
                     if t <= l {
                         continue;
@@ -308,7 +321,7 @@ async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Opt
         }
         .await;
         let api_error = matches!(&r, Err(e) if matches!(e.downcast_ref::<kube::Error>(), Some(kube::Error::Api(_))));
-        if previous || api_error {
+        if fixed || api_error {
             break r; // fixed log, or the pod/container is gone
         }
         match (&r, got) {
@@ -331,6 +344,74 @@ async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Opt
     }
     b.rev += 1;
     ctx.request_repaint();
+}
+
+/// Writes logs to `path` as they arrive (the whole log can be far bigger than the view): each source
+/// in turn, headed `==> pod/container <==` when there are several, from `from` (else the start) to
+/// `to` (else now), optionally only the lines `only` matches. `done` counts bytes; `stop` cancels,
+/// removing the partial file.
+#[allow(clippy::too_many_arguments)]
+async fn download(
+    client: Client,
+    srcs: Vec<Source>,
+    previous: bool,
+    (from, to): (Option<jiff::Timestamp>, Option<jiff::Timestamp>),
+    keep_ts: bool,
+    only: Option<Matcher>,
+    path: PathBuf,
+    (done, stop): (Arc<AtomicU64>, Arc<AtomicBool>),
+    ctx: egui::Context,
+) -> Res<PathBuf> {
+    use std::io::Write;
+    let run = async {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        for (i, s) in srcs.iter().enumerate() {
+            if srcs.len() > 1 {
+                writeln!(out, "{}==> {} <==", if i > 0 { "\n" } else { "" }, s.tag)?;
+            }
+            let lp = LogParams { container: Some(s.container.clone()), previous, timestamps: true, since_time: from, ..Default::default() };
+            let mut lines = Api::<Pod>::namespaced(client.clone(), &s.ns).log_stream(&s.pod, &lp).await?.lines();
+            let mut n = 0u64;
+            while let Some(raw) = lines.next().await {
+                anyhow::ensure!(!stop.load(Ordering::Relaxed), "cancelled");
+                let raw = raw?;
+                let (ts, text) = split_ts(&raw);
+                if ts.zip(to).is_some_and(|(t, end)| t > end) {
+                    break;
+                }
+                if only.as_ref().is_some_and(|m| !m.hit(&strip_ansi(text).0)) {
+                    continue;
+                }
+                let line = if keep_ts { raw.as_str() } else { text };
+                writeln!(out, "{line}")?;
+                done.fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
+                n += 1;
+                if n % 2000 == 0 {
+                    ctx.request_repaint(); // the byte count
+                }
+            }
+        }
+        out.flush()?;
+        anyhow::Ok(())
+    };
+    let r = run.await;
+    ctx.request_repaint();
+    match r {
+        Ok(()) => Ok(path),
+        Err(e) => {
+            std::fs::remove_file(&path).ok();
+            Err(ops::err_text(&e))
+        }
+    }
+}
+
+/// The date-range dialog, filled from the tab's current range and find text.
+struct RangeForm {
+    from: String,
+    to: String,
+    query: String,
+    regex: bool,
+    only: bool,
 }
 
 /// Earlier lines for each source: (lines older than what's loaded, source exhausted).
@@ -363,11 +444,14 @@ pub struct LogTab {
     all_containers: bool,
     sources: Vec<Source>,
     previous: bool,
-    /// "Since" box: what's typed, and what the streams started from (re-read on each start, so
-    /// "2h" stays relative to the reload).
-    since_text: String,
-    since_applied: String,
-    saving: Option<Pending<Res<Option<std::path::PathBuf>>>>,
+    /// Date range shown: (from, to) as typed, re-read on each start so "2h" stays relative to the
+    /// reload; empty = the last lines, following.
+    range: (String, String),
+    range_form: Option<RangeForm>,
+    /// Save dialog + write (Save…, downloads): the file written, `None` when cancelled.
+    saving: Option<Pending<Res<Option<PathBuf>>>>,
+    /// A running download: bytes written, cancel.
+    progress: Option<(Arc<AtomicU64>, Arc<AtomicBool>)>,
     /// A message shown in place of the stream status for a while: (text, is an error, when).
     note: Option<(String, bool, Instant)>,
     show_ts: bool,
@@ -411,9 +495,10 @@ impl LogTab {
             all_containers: false,
             sources: vec![],
             previous: false,
-            since_text: String::new(),
-            since_applied: String::new(),
+            range: Default::default(),
+            range_form: None,
             saving: None,
+            progress: None,
             note: None,
             show_ts: false,
             show_src: false,
@@ -457,13 +542,157 @@ impl LogTab {
         self.epoch += 1;
         self.exhausted = false;
         self.earlier = None;
-        let from = parse_since(&self.since_applied, &jiff::Zoned::now()).ok().flatten();
+        let (from, to) = self.bounds();
+        self.exhausted = to.is_some(); // a closed range: "Earlier" would fetch from the end of the log
         self._streams = self
             .sources
             .iter()
             .enumerate()
-            .map(|(i, s)| Bg::spawn(stream(self.client.clone(), s.clone(), i as u16, self.previous, from, buf.clone(), ctx.clone())))
+            .map(|(i, s)| Bg::spawn(stream(self.client.clone(), s.clone(), i as u16, self.previous, from, to, buf.clone(), ctx.clone())))
             .collect();
+    }
+
+    /// The range as timestamps, relative ones counted from now.
+    fn bounds(&self) -> (Option<jiff::Timestamp>, Option<jiff::Timestamp>) {
+        let now = jiff::Zoned::now();
+        let at = |s: &str| parse_since(s, &now).ok().flatten();
+        (at(&self.range.0), at(&self.range.1))
+    }
+
+    fn range_label(&self) -> String {
+        match (self.range.0.as_str(), self.range.1.as_str()) {
+            ("", "") => format!("Last {TAIL} lines"),
+            (f, "") => format!("Since {f}"),
+            ("", t) => format!("Until {t}"),
+            (f, t) => format!("{f} → {t}"),
+        }
+    }
+
+    /// Save dialog, then every line of the shown pods/containers in the range (all of it when
+    /// open-ended), written as it streams in.
+    fn start_download(&mut self, ctx: &egui::Context, bounds: (Option<jiff::Timestamp>, Option<jiff::Timestamp>), only: Option<Matcher>) {
+        let name = match self.pods.as_slice() {
+            [p] => format!("{}.log", p.name), // pod names are safe file names
+            _ => "logs.log".into(),
+        };
+        let dialog = rfd::AsyncFileDialog::new().set_title("Download logs").set_file_name(name).add_filter("Log", &["log", "txt"]);
+        let progress = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+        self.progress = Some(progress.clone());
+        let (client, srcs, previous, keep_ts, c) = (self.client.clone(), self.sources.clone(), self.previous, self.show_ts, ctx.clone());
+        self.saving = Some(Pending::spawn(ctx, async move {
+            let Some(f) = dialog.save_file().await else { return Ok(None) };
+            download(client, srcs, previous, bounds, keep_ts, only, f.path().to_path_buf(), progress, c).await.map(Some)
+        }));
+    }
+
+    /// The date-range dialog; true when the log has to restart.
+    fn range_modal(&mut self, ctx: &egui::Context) -> bool {
+        let Some(f) = &mut self.range_form else { return false };
+        let now = jiff::Zoned::now();
+        let (from, to) = (parse_since(&f.from, &now), parse_since(&f.to, &now));
+        let backwards = matches!((&from, &to), (Ok(Some(a)), Ok(Some(b))) if a >= b);
+        let bad_regex = f.regex && !f.query.is_empty() && Matcher::regex(&f.query, false).is_err();
+        let ok = from.is_ok() && to.is_ok() && !backwards && !bad_regex;
+        #[derive(PartialEq)]
+        enum Do {
+            Show,
+            Download,
+            Clear,
+            Cancel,
+        }
+        let mut act = None;
+        let busy = self.saving.is_some();
+        let r = egui::Modal::new(egui::Id::new("log-range")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Logs by date");
+            ui.label(RichText::new("Local time, unless it ends in Z (as shown with Timestamps). 2h, 30m, 1d: that long ago.").weak());
+            ui.add_space(10.0);
+            let from_empty = if f.to.trim().is_empty() { "the last 500 lines" } else { "the start of the log" };
+            for (label, text, parsed, empty) in [("From", &mut f.from, &from, from_empty), ("To", &mut f.to, &to, "now, and keep following")] {
+                ui.horizontal(|ui| {
+                    ui.add_sized([40.0, 20.0], egui::Label::new(label));
+                    ui.add(egui::TextEdit::singleline(text).hint_text("2026-09-28 14:30 · 14:30 · 2h").desired_width(220.0));
+                    match parsed {
+                        Ok(None) => ui.label(RichText::new(empty).weak()),
+                        Ok(Some(t)) => ui.label(t.to_zoned(jiff::tz::TimeZone::system()).strftime("%a %d %b %Y, %H:%M:%S").to_string()),
+                        Err(_) => ui.colored_label(RED, "not a date or time"),
+                    };
+                });
+            }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_sized([40.0, 20.0], egui::Label::new(RichText::new("Last").weak()));
+                for (label, ago) in [("15 min", "15m"), ("1 hour", "1h"), ("6 hours", "6h"), ("24 hours", "24h")] {
+                    if ui.small_button(label).clicked() {
+                        (f.from, f.to) = (ago.into(), String::new());
+                    }
+                }
+                if ui.small_button("Today").clicked() {
+                    (f.from, f.to) = (now.date().to_string(), String::new());
+                }
+                if ui.small_button("Yesterday").clicked() {
+                    let yesterday = now.date().yesterday().unwrap_or(now.date());
+                    (f.from, f.to) = (yesterday.to_string(), now.date().to_string());
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 20.0], egui::Label::new("Text"));
+                ui.add(egui::TextEdit::singleline(&mut f.query).hint_text("optional: find in these lines").desired_width(220.0));
+                ui.toggle_value(&mut f.regex, ".*").on_hover_text("Regular expression");
+                ui.add_enabled(!f.query.is_empty(), egui::Checkbox::new(&mut f.only, "Only matching lines"));
+            });
+            if backwards {
+                ui.colored_label(RED, "“To” has to be after “From”.");
+            }
+            if bad_regex {
+                ui.colored_label(RED, "Not a valid regular expression.");
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Clear").on_hover_text("Back to the last 500 lines, following").clicked() {
+                    act = Some(Do::Clear);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(ok, egui::Button::new(RichText::new("Show").strong())).on_hover_text("Enter").clicked() || (ok && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        act = Some(Do::Show);
+                    }
+                    let tip = "Every line of this range to a file (only the matching ones with \"Only matching lines\"), however many";
+                    if ui.add_enabled(ok && !busy, egui::Button::new("⬇ Download…")).on_hover_text(tip).clicked() {
+                        act = Some(Do::Download);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        act = Some(Do::Cancel);
+                    }
+                });
+            });
+        });
+        if r.should_close() && act.is_none() {
+            act = Some(Do::Cancel);
+        }
+        let Some(act) = act else { return false };
+        let f = self.range_form.take().expect("open");
+        match act {
+            Do::Cancel => false,
+            Do::Clear => {
+                self.range = Default::default();
+                true
+            }
+            Do::Show => {
+                self.range = (f.from.trim().to_string(), f.to.trim().to_string());
+                if !f.query.is_empty() {
+                    (self.find.query, self.find.regex, self.find.open) = (f.query, f.regex, true);
+                }
+                self.only_matching = f.only && !self.find.query.is_empty();
+                true
+            }
+            Do::Download => {
+                let only = (f.only && !f.query.is_empty()).then(|| if f.regex { Matcher::regex(&f.query, false).ok() } else { Some(Matcher::plain(&f.query, false)) }).flatten();
+                let (from, to) = (from.ok().flatten(), to.ok().flatten());
+                self.start_download(ctx, (from, to), only);
+                false
+            }
+        }
     }
 
     fn load_earlier(&mut self, ctx: &egui::Context) {
@@ -505,6 +734,7 @@ impl LogTab {
             }
         }
         if let Some(r) = take(&mut self.saving) {
+            self.progress = None;
             self.note = match r {
                 Ok(Some(path)) => Some((format!("Saved to {}", path.display()), false, Instant::now())),
                 Ok(None) => None, // cancelled
@@ -532,14 +762,19 @@ impl LogTab {
         let b = self.buf.lock().unwrap();
         if self.init.is_none() && !self.pods.is_empty() {
             let live = self.sources.len() - b.ended;
-            self.status = match (b.errors.last(), live, self.previous) {
+            let fixed = self.previous || !self.range.1.is_empty(); // read once, not followed
+            self.status = match (b.errors.last(), live, fixed) {
                 (Some(e), _, _) => e.clone(),
                 (None, 0, false) => "streams ended".into(),
                 (None, 0, true) => "loaded".into(),
                 (None, n, _) => format!("following {n} stream{}", if n == 1 { "" } else { "s" }),
             };
-            if !self.since_applied.is_empty() && b.errors.is_empty() {
-                self.status += &format!(" · since {}", self.since_applied);
+            if self.range != Default::default() && b.errors.is_empty() {
+                let label = self.range_label();
+                self.status += &format!(" · {label}");
+            }
+            if b.lines.len() >= MAX_LINES {
+                self.status += &format!(" · the newest {MAX_LINES} lines (Download keeps them all)");
             }
         }
     }
@@ -603,18 +838,10 @@ impl LogTab {
                 }
             }
             restart |= ui.checkbox(&mut self.previous, "Previous").on_hover_text("Logs of the previous (crashed) container").changed();
-            let since = ui.add(egui::TextEdit::singleline(&mut self.since_text).hint_text("Since: 2h, 14:30…").desired_width(130.0)).on_hover_text(
-                "Start the log here (Enter):\n  2h · 30m · 1d · 1h 30m — that long ago\n  14:30 — today, local time\n  2026-09-28 14:30 — local time\n  2026-09-26T11:10:46Z — UTC, as shown with Timestamps\nEmpty: the last 500 lines",
-            );
-            if since.lost_focus() && self.since_text.trim() != self.since_applied {
-                match parse_since(&self.since_text, &jiff::Zoned::now()) {
-                    Ok(_) => {
-                        self.since_applied = self.since_text.trim().to_string();
-                        self.note = None;
-                        restart = true;
-                    }
-                    Err(e) => self.note = Some((e, true, Instant::now())),
-                }
+            let range = egui::Button::new(format!("📅 {}", self.range_label())).selected(self.range != Default::default());
+            if ui.add(range).on_hover_text("Show or download the logs of a date range, optionally only the lines with a text").clicked() {
+                let (from, to) = self.range.clone();
+                self.range_form = Some(RangeForm { from, to, query: self.find.query.clone(), regex: self.find.regex, only: self.only_matching });
             }
             ui.checkbox(&mut self.show_ts, "Timestamps");
             ui.checkbox(&mut self.show_src, "Pod name");
@@ -644,18 +871,35 @@ impl LogTab {
                     std::fs::write(&path, text).map(|_| Some(path)).map_err(|e| e.to_string())
                 }));
             }
+            match &self.progress {
+                Some((_, stop)) => {
+                    if ui.button("✖ Cancel download").clicked() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    let tip = "Every line the pod still has, not only the loaded ones: its whole log (the previous container's with Previous), timestamps with Timestamps";
+                    if ui.add_enabled(self.saving.is_none() && !self.sources.is_empty(), egui::Button::new("⬇ Download all…")).on_hover_text(tip).clicked() {
+                        self.start_download(ui.ctx(), (None, None), None);
+                    }
+                }
+            }
             restart |= ui.button("⟳ Reload").clicked();
             if self.earlier.is_some() || self.init.is_some() {
                 ui.spinner();
             }
             // One line, truncated: a long error must not push the find bar around.
+            let written = self.progress.as_ref().map_or(0, |(done, _)| done.load(Ordering::Relaxed));
+            let downloading = format!("Downloading… {}", ops::fmt_bytes(written as f64));
             let (text, error) = match &self.note {
+                _ if written > 0 => (&downloading, false),
                 Some((n, e, at)) if at.elapsed() < Duration::from_secs(8) => (n, *e),
                 _ => (&self.status, self.status.contains(':')),
             };
             let color = if error { RED } else { ui.visuals().weak_text_color() };
             ui.add(egui::Label::new(RichText::new(text).color(color)).truncate()).on_hover_text(text);
         });
+        restart |= self.range_modal(ui.ctx());
         if restart && !self.pods.is_empty() {
             self.start(ui.ctx());
         }

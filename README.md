@@ -35,9 +35,13 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
 - **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
   wrap, timestamps, previous container, Ctrl+F find (plain or regex, only-matching), scrolling to the
-  top loads earlier lines, dropped connections resume on their own. **Since** starts the log at a time:
-  `2h`, `30m`, `1d`, `14:30` (today), `2026-09-28 14:30` (local) or a UTC timestamp copied from a line.
-  **Save…** writes the shown lines (filter and options applied) to a `.log` file.
+  top loads earlier lines, dropped connections resume on their own. **📅 Logs by date** (a dialog) shows a
+  date range, From and To: `2026-09-28 14:30`, `14:30` (today), `2h` / `30m` / `1d` ago, a UTC timestamp
+  copied from a line, or Last 15 min / 1 h / 6 h / 24 h / Today / Yesterday; To empty keeps following.
+  It can also find a text in those lines (only matching, regex) and download the range to a file.
+  **Save…** writes the shown lines (filter and options applied) to a `.log` file; **⬇ Download all…**
+  streams every line the pod still has (the previous container's with Previous, timestamps with
+  Timestamps; several pods or containers one after the other), with its size as it goes and Cancel.
 - **Ctrl+K** finds text in the current view (lists, details, YAML, logs). Collapsed sections with
   matches open; hidden secret values are searched too and flagged without being revealed.
 - **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
