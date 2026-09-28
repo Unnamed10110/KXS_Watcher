@@ -253,16 +253,41 @@ async fn pod_infos(client: Client, targets: Vec<(Kind, String, String)>) -> Res<
     Ok(out)
 }
 
+/// Where a log starts: empty for the last lines; a timestamp as shown with Timestamps on (UTC,
+/// ends in `Z`); a local date and/or time (`2026-09-28 14:30`, `2026-09-28`, `14:30` today); or how
+/// long ago (`2h`, `30m`, `1d`, `1h 30m`).
+fn parse_since(s: &str, now: &jiff::Zoned) -> Result<Option<jiff::Timestamp>, String> {
+    use jiff::civil;
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let local = |dt: civil::DateTime| dt.to_zoned(now.time_zone().clone()).map(|z| z.timestamp());
+    let t = if let Ok(t) = s.parse::<jiff::Timestamp>() {
+        Ok(t)
+    } else if let Ok(dt) = s.parse::<civil::DateTime>() {
+        local(dt)
+    } else if let Ok(t) = s.parse::<civil::Time>() {
+        local(now.date().to_datetime(t))
+    } else if let Ok(span) = s.parse::<jiff::Span>() {
+        now.checked_sub(span).map(|z| z.timestamp())
+    } else {
+        return Err(format!("Since: can't read \"{s}\" (try 2h, 14:30 or 2026-09-28 14:30)"));
+    };
+    t.map(Some).map_err(|e| format!("Since: {e}"))
+}
+
 /// Follow one container's log. Dropped connections (load balancers cut idle streams) are resumed
 /// from the last line's timestamp; the stream only ends when the API says so or the log stays shut.
-async fn stream(client: Client, src: Source, idx: u16, previous: bool, buf: Arc<Mutex<LogBuf>>, ctx: egui::Context) {
+/// It starts at `from` (every line since then), else with the last `TAIL` lines.
+async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Option<jiff::Timestamp>, buf: Arc<Mutex<LogBuf>>, ctx: egui::Context) {
     let api: Api<Pod> = Api::namespaced(client, &src.ns);
     let (mut last, mut quiet, mut backoff) = (None::<jiff::Timestamp>, 0, 1);
     let result = loop {
         // sinceTime has whole-second precision: go back a second and drop what we already have.
         // ponytail: a not-yet-seen line with exactly the last timestamp would be skipped on resume.
-        let since = last.and_then(|t| t.checked_sub(jiff::SignedDuration::from_secs(1)).ok());
-        let tail = if last.is_none() { Some(TAIL) } else { None };
+        let since = last.and_then(|t| t.checked_sub(jiff::SignedDuration::from_secs(1)).ok()).or(from);
+        let tail = if last.is_none() && from.is_none() { Some(TAIL) } else { None };
         let lp = LogParams { container: Some(src.container.clone()), follow: !previous, previous, timestamps: true, tail_lines: tail, since_time: since, ..Default::default() };
         let mut got = 0;
         let r: anyhow::Result<()> = async {
@@ -338,6 +363,13 @@ pub struct LogTab {
     all_containers: bool,
     sources: Vec<Source>,
     previous: bool,
+    /// "Since" box: what's typed, and what the streams started from (re-read on each start, so
+    /// "2h" stays relative to the reload).
+    since_text: String,
+    since_applied: String,
+    saving: Option<Pending<Res<Option<std::path::PathBuf>>>>,
+    /// A message shown in place of the stream status for a while: (text, is an error, when).
+    note: Option<(String, bool, Instant)>,
     show_ts: bool,
     show_src: bool,
     wrap: bool,
@@ -379,6 +411,10 @@ impl LogTab {
             all_containers: false,
             sources: vec![],
             previous: false,
+            since_text: String::new(),
+            since_applied: String::new(),
+            saving: None,
+            note: None,
             show_ts: false,
             show_src: false,
             wrap: false,
@@ -421,11 +457,12 @@ impl LogTab {
         self.epoch += 1;
         self.exhausted = false;
         self.earlier = None;
+        let from = parse_since(&self.since_applied, &jiff::Zoned::now()).ok().flatten();
         self._streams = self
             .sources
             .iter()
             .enumerate()
-            .map(|(i, s)| Bg::spawn(stream(self.client.clone(), s.clone(), i as u16, self.previous, buf.clone(), ctx.clone())))
+            .map(|(i, s)| Bg::spawn(stream(self.client.clone(), s.clone(), i as u16, self.previous, from, buf.clone(), ctx.clone())))
             .collect();
     }
 
@@ -467,6 +504,13 @@ impl LogTab {
                 Err(e) => self.status = e,
             }
         }
+        if let Some(r) = take(&mut self.saving) {
+            self.note = match r {
+                Ok(Some(path)) => Some((format!("Saved to {}", path.display()), false, Instant::now())),
+                Ok(None) => None, // cancelled
+                Err(e) => Some((format!("Save failed: {e}"), true, Instant::now())),
+            };
+        }
         if let Some(r) = take(&mut self.earlier) {
             match r {
                 Ok(per_src) => {
@@ -494,6 +538,9 @@ impl LogTab {
                 (None, 0, true) => "loaded".into(),
                 (None, n, _) => format!("following {n} stream{}", if n == 1 { "" } else { "s" }),
             };
+            if !self.since_applied.is_empty() && b.errors.is_empty() {
+                self.status += &format!(" · since {}", self.since_applied);
+            }
         }
     }
 
@@ -556,6 +603,19 @@ impl LogTab {
                 }
             }
             restart |= ui.checkbox(&mut self.previous, "Previous").on_hover_text("Logs of the previous (crashed) container").changed();
+            let since = ui.add(egui::TextEdit::singleline(&mut self.since_text).hint_text("Since: 2h, 14:30…").desired_width(130.0)).on_hover_text(
+                "Start the log here (Enter):\n  2h · 30m · 1d · 1h 30m — that long ago\n  14:30 — today, local time\n  2026-09-28 14:30 — local time\n  2026-09-26T11:10:46Z — UTC, as shown with Timestamps\nEmpty: the last 500 lines",
+            );
+            if since.lost_focus() && self.since_text.trim() != self.since_applied {
+                match parse_since(&self.since_text, &jiff::Zoned::now()) {
+                    Ok(_) => {
+                        self.since_applied = self.since_text.trim().to_string();
+                        self.note = None;
+                        restart = true;
+                    }
+                    Err(e) => self.note = Some((e, true, Instant::now())),
+                }
+            }
             ui.checkbox(&mut self.show_ts, "Timestamps");
             ui.checkbox(&mut self.show_src, "Pod name");
             ui.checkbox(&mut self.wrap, "Wrap");
@@ -571,13 +631,30 @@ impl LogTab {
             if ui.button("Copy").on_hover_text("Copy the shown lines").clicked() {
                 ui.ctx().copy_text(self.visible_text());
             }
+            if ui.add_enabled(self.saving.is_none(), egui::Button::new("Save…")).on_hover_text("Save the shown lines to a file").clicked() {
+                let text = self.visible_text();
+                let name = match self.pods.as_slice() {
+                    [p] => format!("{}.log", p.name), // pod names are safe file names
+                    _ => "logs.log".into(),
+                };
+                let dialog = rfd::AsyncFileDialog::new().set_title("Save logs").set_file_name(name).add_filter("Log", &["log", "txt"]);
+                self.saving = Some(Pending::spawn(ui.ctx(), async move {
+                    let Some(f) = dialog.save_file().await else { return Ok(None) };
+                    let path = f.path().to_path_buf();
+                    std::fs::write(&path, text).map(|_| Some(path)).map_err(|e| e.to_string())
+                }));
+            }
             restart |= ui.button("⟳ Reload").clicked();
             if self.earlier.is_some() || self.init.is_some() {
                 ui.spinner();
             }
             // One line, truncated: a long error must not push the find bar around.
-            let color = if self.status.contains(':') { RED } else { ui.visuals().weak_text_color() };
-            ui.add(egui::Label::new(RichText::new(&self.status).color(color)).truncate()).on_hover_text(&self.status);
+            let (text, error) = match &self.note {
+                Some((n, e, at)) if at.elapsed() < Duration::from_secs(8) => (n, *e),
+                _ => (&self.status, self.status.contains(':')),
+            };
+            let color = if error { RED } else { ui.visuals().weak_text_color() };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate()).on_hover_text(text);
         });
         if restart && !self.pods.is_empty() {
             self.start(ui.ctx());
@@ -914,6 +991,21 @@ impl YamlTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_start_points() {
+        let now: jiff::Zoned = "2026-09-28T15:00:00-03:00[-03:00]".parse().unwrap();
+        let at = |s: &str| parse_since(s, &now).unwrap().map(|t| t.to_string());
+        assert_eq!(at(""), None);
+        assert_eq!(at("2026-09-26T11:10:46.495Z").as_deref(), Some("2026-09-26T11:10:46.495Z")); // copied from a line
+        assert_eq!(at("2026-09-28 14:30").as_deref(), Some("2026-09-28T17:30:00Z")); // local time
+        assert_eq!(at("2026-09-28").as_deref(), Some("2026-09-28T03:00:00Z"));
+        assert_eq!(at("14:30").as_deref(), Some("2026-09-28T17:30:00Z")); // today
+        assert_eq!(at("2h").as_deref(), Some("2026-09-28T16:00:00Z"));
+        assert_eq!(at("1h 30m").as_deref(), Some("2026-09-28T16:30:00Z"));
+        assert_eq!(at("1d").as_deref(), Some("2026-09-27T18:00:00Z"));
+        assert!(parse_since("yesterday-ish", &now).is_err());
+    }
 
     #[test]
     fn parses_timestamp_and_ansi() {

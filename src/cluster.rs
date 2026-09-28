@@ -197,6 +197,20 @@ impl ClusterTab {
         }
     }
 
+    /// Ctrl+W: close the object tab shown, else the page tab.
+    pub fn close_tab(&mut self) {
+        if let Some(r) = &mut self.ready {
+            r.close_tab();
+        }
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab: the next / previous page tab.
+    pub fn step_tab(&mut self, by: isize) {
+        if let Some(r) = self.ready.as_mut().filter(|r| !r.pages.is_empty()) {
+            r.cur = (r.cur as isize + by).rem_euclid(r.pages.len() as isize) as usize;
+        }
+    }
+
     /// The bell: show this cluster's overview.
     pub fn show_overview(&mut self, ctx: &egui::Context) {
         if let Some(r) = &mut self.ready {
@@ -689,6 +703,20 @@ impl Ready {
         self.focus_launcher = true;
     }
 
+    fn close_tab(&mut self) {
+        match self.pages.get_mut(self.cur) {
+            Some(pt) if pt.active > 0 => {
+                pt.subs.remove(pt.active - 1);
+                pt.active -= 1; // its left neighbour, or the list
+            }
+            Some(_) => {
+                let i = self.cur;
+                ui_kit::remove_item(&mut self.pages, i, &mut self.cur);
+            }
+            None => {}
+        }
+    }
+
     /// The current new tab becomes `page` (or, when that page is already open, goes away for it).
     fn replace_launcher(&mut self, ctx: &egui::Context, page: Page) {
         match self.pages.iter().position(|t| t.page == page) {
@@ -1022,10 +1050,7 @@ impl Ready {
             ui_kit::move_item(pages, from, to, &mut self.cur);
         }
         if let Some(i) = close {
-            pages.remove(i);
-            if self.cur > i || self.cur >= pages.len() {
-                self.cur = self.cur.saturating_sub(1); // closing the current tab shows its left neighbour
-            }
+            ui_kit::remove_item(pages, i, &mut self.cur);
         }
         if let Some(i) = keep_only {
             let keep = (i < pages.len()).then(|| pages.swap_remove(i));

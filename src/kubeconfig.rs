@@ -51,6 +51,17 @@ pub fn candidate_files(kubeconfig_env: Option<&std::ffi::OsStr>, extra: &[PathBu
     out
 }
 
+/// Every candidate file with its modification time: differs once one is edited, added or removed.
+pub fn stamp(extra: &[PathBuf]) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    candidate_files(std::env::var_os("KUBECONFIG").as_deref(), extra)
+        .into_iter()
+        .map(|f| {
+            let modified = std::fs::metadata(&f).and_then(|m| m.modified()).ok();
+            (f, modified)
+        })
+        .collect()
+}
+
 pub fn discover(extra: &[PathBuf]) -> Vec<Ctx> {
     candidate_files(std::env::var_os("KUBECONFIG").as_deref(), extra)
         .iter()
@@ -137,6 +148,19 @@ users:
         assert_eq!(ctxs[0].server, "https://10.0.0.1:6443");
         assert_eq!(ctxs[0].namespace.as_deref(), Some("team"));
         assert_eq!(ctxs[1].server, "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stamp_changes_when_a_file_is_added() {
+        let dir = std::env::temp_dir().join(format!("kxs-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = stamp(std::slice::from_ref(&dir));
+        assert_eq!(before, stamp(std::slice::from_ref(&dir)));
+        std::fs::write(dir.join("new-cluster"), KC).unwrap();
+        let after = stamp(std::slice::from_ref(&dir));
+        assert_ne!(before, after);
+        assert!(after.iter().any(|(f, m)| f.ends_with("new-cluster") && m.is_some()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

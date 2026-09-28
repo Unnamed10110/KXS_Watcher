@@ -21,6 +21,7 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Catalog**: contexts from `~/.kube/config`, `$KUBECONFIG` and any extra files/folders
   (Settings; `~/.kube` is scanned by default). Pick files or folders on disk with the native file
   dialog ("Add kubeconfig…" in the catalog, File menu, Settings). Pin, filter, open several clusters as tabs.
+  Files edited, added or removed on disk (kubectl config, other tools) update the list within seconds.
 - **Live lists** for every resource kind, including CRDs, built from the API server's Table
   output (the same columns as `kubectl get`, `Wide` = `-o wide`). Multi-namespace filter, search, sort,
   status colors, CPU/memory columns for pods and nodes (metrics-server).
@@ -34,7 +35,9 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
 - **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
   wrap, timestamps, previous container, Ctrl+F find (plain or regex, only-matching), scrolling to the
-  top loads earlier lines, dropped connections resume on their own.
+  top loads earlier lines, dropped connections resume on their own. **Since** starts the log at a time:
+  `2h`, `30m`, `1d`, `14:30` (today), `2026-09-28 14:30` (local) or a UTC timestamp copied from a line.
+  **Save…** writes the shown lines (filter and options applied) to a `.log` file.
 - **Ctrl+K** finds text in the current view (lists, details, YAML, logs). Collapsed sections with
   matches open; hidden secret values are searched too and flagged without being revealed.
 - **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
@@ -44,7 +47,9 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   blue, yellow, orange: pure black, only the accent lights up), Crimson, Forest, Ocean and Violet.
 - **Tabs**: Ctrl+T (or "+" after the page tabs) opens a new tab: type to pick a view or resource list.
   Drag tabs (clusters, pages, objects) to reorder them; double-click a cluster or page tab to rename it
-  (right-click: rename, reset name, move left/right).
+  (right-click: rename, reset name, move left/right). Ctrl+W closes the tab (the object tab shown,
+  else the page tab; over the dock, the dock tab under the pointer), Ctrl+Tab / Ctrl+Shift+Tab switch
+  page tabs, Ctrl+1…8 go to that cluster and Ctrl+9 to the last one.
 - **Remembers the UI**: window, theme and sizes, open clusters in order and the one shown, their names and
   colors, page and object tabs (names, order, Overview/Events/YAML), namespace filter, Wide, each list's
   filter/regex/sort/status and its open details row, the Search query, panel and column widths.

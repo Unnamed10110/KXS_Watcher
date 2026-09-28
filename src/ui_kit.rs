@@ -528,6 +528,17 @@ pub fn reorder(ui: &Ui, items: &[(Rect, bool, bool)]) -> Option<(usize, usize)> 
     items[from].2.then_some((from, if slot > from { slot - 1 } else { slot }))
 }
 
+/// Removes `v[i]`; `cur` stays on its item, or on the one that takes its place (the left one at the end).
+pub fn remove_item<T>(v: &mut Vec<T>, i: usize, cur: &mut usize) {
+    if i >= v.len() {
+        return;
+    }
+    v.remove(i);
+    if *cur > i || *cur >= v.len() {
+        *cur = cur.saturating_sub(1);
+    }
+}
+
 /// Moves `v[from]` to index `to`, keeping `cur` on the same item.
 pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize, cur: &mut usize) {
     if from >= v.len() || to >= v.len() {
@@ -559,5 +570,18 @@ mod tests {
         assert_eq!((v.iter().collect::<String>(), v[cur]), ("dacb".into(), 'b'));
         move_item(&mut v, 0, 1, &mut cur);
         assert_eq!((v.iter().collect::<String>(), v[cur]), ("adcb".into(), 'b'));
+    }
+
+    #[test]
+    fn removing_keeps_the_current_item() {
+        let (mut v, mut cur) = (vec!['a', 'b', 'c', 'd'], 2); // on 'c'
+        remove_item(&mut v, 0, &mut cur);
+        assert_eq!(v[cur], 'c');
+        remove_item(&mut v, 1, &mut cur); // 'c' itself: its right neighbour takes the place
+        assert_eq!((v.iter().collect::<String>(), v[cur]), ("bd".into(), 'd'));
+        remove_item(&mut v, 1, &mut cur); // the last one: its left neighbour
+        assert_eq!((v.iter().collect::<String>(), cur), ("b".into(), 0));
+        remove_item(&mut v, 0, &mut cur);
+        assert_eq!((v.len(), cur), (0, 0));
     }
 }

@@ -202,6 +202,9 @@ struct App {
     fonts: (String, String),
     /// The last window placement eframe saved while the window was on screen.
     good_window: Option<String>,
+    /// Kubeconfig files and their modification times, checked every few seconds.
+    kube_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    kube_checked: Instant,
 }
 
 /// eframe's saved window placement from while it was minimized (off screen, zero size):
@@ -229,6 +232,8 @@ struct Viewer<'a> {
     find_req: Option<bool>,
     claimed: bool,
     term_hovered: bool,
+    /// The dock tab under the pointer (Ctrl+W closes it).
+    hovered: Option<u64>,
     accents: &'a HashMap<String, Color32>,
 }
 
@@ -271,6 +276,9 @@ impl TabViewer for Viewer<'_> {
     fn ui(&mut self, ui: &mut Ui, t: &mut Tab) {
         let hovered = ui.rect_contains_pointer(ui.max_rect());
         self.term_hovered |= hovered && matches!(t.body, Body::Term(_));
+        if hovered {
+            self.hovered = Some(t.id);
+        }
         if let (Some(filter), true, false) = (self.find_req, hovered, self.claimed) {
             self.claimed = t.open_find(filter);
         }
@@ -303,6 +311,8 @@ impl App {
         }
         let mut app = App {
             contexts: kubeconfig::discover(&settings.paths),
+            kube_stamp: kubeconfig::stamp(&settings.paths),
+            kube_checked: Instant::now(),
             paths_text: settings.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
             settings,
             clusters: vec![],
@@ -363,6 +373,30 @@ impl App {
             0 if rejected.is_empty() => self.toasts.push(("No new contexts: already listed".into(), false, now)),
             0 => {}
             n => self.toasts.push((format!("Added {n} context{}", if n == 1 { "" } else { "s" }), false, now)),
+        }
+    }
+
+    /// Kubeconfigs edited, added or removed on disk (kubectl config, other tools) update the
+    /// cluster list; open clusters keep their connection.
+    fn watch_kubeconfigs(&mut self, ctx: &egui::Context) {
+        const EVERY: Duration = Duration::from_secs(3);
+        ctx.request_repaint_after(EVERY);
+        if self.kube_checked.elapsed() < EVERY {
+            return;
+        }
+        self.kube_checked = Instant::now();
+        let stamp = kubeconfig::stamp(&self.settings.paths);
+        if stamp == self.kube_stamp {
+            return;
+        }
+        self.kube_stamp = stamp;
+        let before: HashSet<String> = self.contexts.iter().map(|c| c.id()).collect();
+        self.contexts = kubeconfig::discover(&self.settings.paths);
+        let after: HashSet<String> = self.contexts.iter().map(|c| c.id()).collect();
+        let (added, removed) = (after.difference(&before).count(), before.difference(&after).count());
+        if added + removed > 0 {
+            let change = [(added, "+"), (removed, "−")].iter().filter(|(n, _)| *n > 0).map(|(n, s)| format!("{s}{n}")).collect::<Vec<_>>().join(" ");
+            self.toasts.push((format!("Kubeconfig changed: {} contexts ({change})", self.contexts.len()), false, Instant::now()));
         }
     }
 
@@ -883,6 +917,10 @@ impl App {
                                 heading(ui, "Keyboard shortcuts", "");
                                 egui::Grid::new("shortcuts").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
                                     for (k, what) in [
+                                        ("Ctrl T", "New tab"),
+                                        ("Ctrl W", "Close the tab (the dock tab under the pointer)"),
+                                        ("Ctrl Tab", "Next tab (Shift: previous)"),
+                                        ("Ctrl 1…9", "Go to cluster 1…8, 9 for the last"),
                                         ("Ctrl K", "Find text in the current view"),
                                         ("Ctrl F", "Focus the list filter (find in logs and YAML)"),
                                         ("Ctrl A", "Select every row shown"),
@@ -1029,6 +1067,28 @@ impl eframe::App for App {
                 _ => self.show_catalog = true,
             }
         }
+        // Ctrl+W (after the dock is drawn: it may be the one under the pointer), Ctrl+Tab /
+        // Ctrl+Shift+Tab for the next / previous tab, Ctrl+1…8 for cluster N and Ctrl+9 for the last.
+        let mut close_req = false;
+        if !self.term_hovered {
+            use egui::{Key, Modifiers};
+            const NUMS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+            let (close, step, num) = ui.input_mut(|i| {
+                let close = i.consume_key(Modifiers::COMMAND, Key::W);
+                let step = if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab) { -1 } else { i.consume_key(Modifiers::COMMAND, Key::Tab) as isize };
+                (close, step, NUMS.iter().position(|k| i.consume_key(Modifiers::COMMAND, *k)))
+            });
+            close_req = close;
+            if step != 0
+                && let Some(Body::Cluster(c)) = self.clusters.get_mut(self.cur).map(|t| &mut t.body)
+            {
+                c.step_tab(step);
+            }
+            if let (Some(n), false) = (num, self.clusters.is_empty()) {
+                self.cur = if n == 8 { self.clusters.len() - 1 } else { n.min(self.clusters.len() - 1) };
+            }
+        }
+        self.watch_kubeconfigs(&ctx);
         if let Some(picked) = take(&mut self.picking).filter(|p| !p.is_empty()) {
             self.add_sources(picked);
         }
@@ -1045,10 +1105,11 @@ impl eframe::App for App {
 
         let mut out = Out { node_image: self.settings.node_shell_image.clone(), ..Default::default() };
         let accents = self.settings.accents.clone();
-        let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_hovered: false, accents: &accents };
+        let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_hovered: false, hovered: None, accents: &accents };
+        let mut dock_hovered = false;
         if self.dock.iter_all_tabs().next().is_some() {
             let max = (ui.available_height() - 200.0).max(160.0);
-            egui::Panel::bottom("dock").resizable(true).default_size(280.0).size_range(120.0..=max).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
+            dock_hovered = egui::Panel::bottom("dock").resizable(true).default_size(280.0).size_range(120.0..=max).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
                 let mut style = Style::from_egui(ui.style());
                 style.tab_bar.bg_fill = t.chrome;
                 style.tab_bar.hline_color = t.line;
@@ -1063,10 +1124,20 @@ impl eframe::App for App {
                     s.text_color = t.muted;
                 }
                 DockArea::new(&mut self.dock).id(egui::Id::new("tool-dock")).style(style).show_leaf_collapse_buttons(false).show_inside(ui, &mut viewer);
-            });
+            })
+            .response
+            .contains_pointer();
         }
-        let (claimed, term_hovered) = (viewer.claimed, viewer.term_hovered);
+        let (claimed, term_hovered, hovered_tab) = (viewer.claimed, viewer.term_hovered, viewer.hovered);
         self.term_hovered = term_hovered;
+        // Ctrl+W: the dock tab under the pointer (or the focused one), else the cluster's current tab.
+        if close_req && dock_hovered {
+            if let Some(path) = hovered_tab.or_else(|| self.dock.find_active_focused().map(|(_, t)| t.id)).and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
+                self.dock.remove_tab(path);
+            }
+        } else if close_req && let Some(Body::Cluster(c)) = self.clusters.get_mut(self.cur).map(|t| &mut t.body) {
+            c.close_tab();
+        }
 
         let first_new = out.tabs.len();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg)).show(ui, |ui| {
