@@ -247,11 +247,12 @@ impl List {
             return;
         }
         let (q, kind) = (self.search.trim(), &self.kind);
-        // Plain: ASCII case-insensitive substring. Regex: case-insensitive; an invalid one filters nothing.
+        // Plain: case-insensitive text, `|` and `*` like Lens (`Matcher::wildcard`). Regex:
+        // case-insensitive; an invalid one filters nothing.
         let filt = match (q.is_empty(), self.filter_re) {
             (true, _) => Ok(None),
             (false, true) => Matcher::regex(q, false).map(Some),
-            (false, false) => Ok(Some(Matcher::plain(q, false))),
+            (false, false) => Ok(Some(Matcher::wildcard(q))),
         };
         self.filter_error = filt.as_ref().err().cloned();
         let filt = filt.unwrap_or(None);
@@ -451,7 +452,7 @@ impl List {
                             } else if hits.is_empty() && !r.deleting && matches!(name.as_str(), "Status" | "Phase") && status.is_some() && !text.is_empty() {
                                 ui_kit::pill(ui, &text, status.unwrap_or(GREEN));
                             } else if hits.is_empty() && *c == DCol::Ns && !text.is_empty() {
-                                ui_kit::chip(ui, &text, egui::FontId::proportional(12.0));
+                                ui_kit::chip(ui, &text, ui_kit::prop(12.0));
                             } else if hits.is_empty() {
                                 ui.add(egui::Label::new(rt).truncate().selectable(false));
                             } else {
@@ -567,6 +568,34 @@ mod tests {
         l.refresh(&d, &m);
         assert_eq!(l.view.len(), 2);
         assert!(l.filter_error.is_none());
+        (l.filter_re, l.search) = (false, "argocd*ha*0".into()); // `*` in the middle
+        l.refresh(&d, &m);
+        assert_eq!(l.view.len(), 1);
+    }
+
+    #[test]
+    fn filter_like_lens() {
+        let kind = Kind { ar: kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&()), namespaced: true, verbs: vec![] };
+        let mut l = List {
+            kind, data: Default::default(), _watches: vec![], view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None,
+            status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
+        };
+        let mut d = ListData::default();
+        for n in ["jpts-pos-1-55d6", "api-ingenico-gw", "AS400-proxy", "feitian-x", "api-cnp"] {
+            let r = row(n, "1", &[n]);
+            d.rows.insert(r.uid.clone(), r);
+        }
+        let m = Metrics::default();
+        for re in [false, true] {
+            (l.filter_re, l.search) = (re, "jpts*|ingenico*|as400*".into());
+            l.refresh(&d, &m);
+            let mut names: Vec<&str> = l.view.iter().map(|r| r.name.as_str()).collect();
+            names.sort();
+            assert_eq!(names, ["AS400-proxy", "api-ingenico-gw", "jpts-pos-1-55d6"], "regex {re}");
+        }
+        (l.filter_re, l.search) = (false, " | ".into()); // nothing but separators: everything
+        l.refresh(&d, &m);
+        assert_eq!(l.view.len(), 5);
     }
 
     #[test]

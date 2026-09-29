@@ -76,12 +76,128 @@ pub fn status_fg(ui: &Ui, c: Color32) -> Color32 {
     if ui.visuals().dark_mode { mix(c, Color32::WHITE, 0.3) } else { mix(c, Color32::BLACK, 0.15) }
 }
 
+// ---------------------------------------------------------------- font size per area
+
+/// Font size of each part of the window, as a factor of its normal size (Settings › Appearance).
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Sizes {
+    pub tabs: f32,
+    pub sidebar: f32,
+    pub lists: f32,
+    pub details: f32,
+    pub logs: f32,
+    pub editor: f32,
+    pub terminal: f32,
+}
+
+impl Default for Sizes {
+    fn default() -> Self {
+        Sizes { tabs: 1.0, sidebar: 1.0, lists: 1.0, details: 1.0, logs: 1.0, editor: 1.0, terminal: 1.0 }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Area {
+    Tabs,
+    Sidebar,
+    Lists,
+    Details,
+    Logs,
+    Editor,
+    Terminal,
+}
+
+impl Area {
+    /// Every area with its name and what it covers, for Settings.
+    pub const ALL: [(Area, &'static str, &'static str); 7] = [
+        (Area::Tabs, "Tabs", "Cluster, page, object and dock tabs"),
+        (Area::Sidebar, "Sidebar", "Resources, cluster card and namespaces"),
+        (Area::Lists, "Lists and pages", "Resource tables, overview, search, Helm"),
+        (Area::Details, "Details", "The details panel and object tabs"),
+        (Area::Logs, "Logs", "Log lines and their toolbar"),
+        (Area::Editor, "YAML editor", "Edit YAML tabs"),
+        (Area::Terminal, "Terminal", "Pod shells and local terminals"),
+    ];
+}
+
+impl Sizes {
+    pub fn get_mut(&mut self, a: Area) -> &mut f32 {
+        match a {
+            Area::Tabs => &mut self.tabs,
+            Area::Sidebar => &mut self.sidebar,
+            Area::Lists => &mut self.lists,
+            Area::Details => &mut self.details,
+            Area::Logs => &mut self.logs,
+            Area::Editor => &mut self.editor,
+            Area::Terminal => &mut self.terminal,
+        }
+    }
+}
+
+thread_local! {
+    static SIZES: std::cell::Cell<Sizes> = std::cell::Cell::new(Sizes::default());
+    /// Factor of the area being drawn; 1 outside any.
+    static SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// The settings' sizes, set once a frame.
+pub fn set_sizes(s: Sizes) {
+    SIZES.with(|c| c.set(s));
+}
+
+pub fn factor(a: Area) -> f32 {
+    let mut s = SIZES.with(|c| c.get());
+    s.get_mut(a).clamp(0.5, 2.0)
+}
+
+/// `v` (a fixed font size, or a height around text) at the size of the area being drawn.
+pub fn sz(v: f32) -> f32 {
+    v * SCALE.with(|c| c.get())
+}
+
+/// Fixed-size fonts and heights (`sz`, `semibold`, `mono`, `prop`) follow `area` until dropped.
+pub struct AreaScale(f32);
+
+impl Drop for AreaScale {
+    fn drop(&mut self) {
+        SCALE.with(|c| c.set(self.0));
+    }
+}
+
+pub fn area(a: Area) -> AreaScale {
+    AreaScale(SCALE.with(|c| c.replace(factor(a))))
+}
+
+/// Draws `add` at `a`'s size: the fixed-size fonts, the style's text sizes and the row height. Nested
+/// areas take their own size, not a multiple of the outer one.
+pub fn scaled<R>(ui: &mut Ui, a: Area, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let _area = area(a);
+    let f = factor(a);
+    let base = ui.ctx().global_style();
+    ui.scope(|ui| {
+        let s = ui.style_mut();
+        for (style, font) in s.text_styles.iter_mut() {
+            if let Some(b) = base.text_styles.get(style) {
+                font.size = b.size * f;
+            }
+        }
+        s.spacing.interact_size.y = base.spacing.interact_size.y * f;
+        add(ui)
+    })
+    .inner
+}
+
 pub fn semibold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(crate::theme::SEMIBOLD.into()))
+    FontId::new(sz(size), FontFamily::Name(crate::theme::SEMIBOLD.into()))
 }
 
 pub fn mono(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Monospace)
+    FontId::new(sz(size), FontFamily::Monospace)
+}
+
+pub fn prop(size: f32) -> FontId {
+    FontId::proportional(sz(size))
 }
 
 // ---------------------------------------------------------------- icons
@@ -275,10 +391,10 @@ pub fn button(ui: &mut Ui, kind: Btn, icon_: Option<Icon>, text: &str) -> Respon
         Btn::On => (t.accent_soft, Stroke::NONE, t.text),
         Btn::Ghost => (Color32::TRANSPARENT, Stroke::NONE, t.muted),
     };
-    let font = if kind == Btn::Primary { semibold(13.0) } else { FontId::proportional(13.0) };
+    let font = if kind == Btn::Primary { semibold(13.0) } else { prop(13.0) };
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
     let icon_w = if icon_.is_some() { 14.0 + if text.is_empty() { 0.0 } else { 6.0 } } else { 0.0 };
-    let size = vec2(galley.size().x + icon_w + 20.0, 30.0);
+    let size = vec2(galley.size().x + icon_w + 20.0, sz(30.0));
     let (rect, r) = ui.allocate_exact_size(size, Sense::click());
     let hover = r.hovered() && ui.is_enabled();
     let fill = match (hover, kind) {
@@ -304,7 +420,7 @@ pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let t = tokens(ui);
     let fg = status_fg(ui, color);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), semibold(12.0), fg);
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 16.0, 20.0), Sense::hover());
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 16.0, sz(20.0)), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(10), mix(t.bg, color, if t.dark { 0.16 } else { 0.14 }));
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
     r
@@ -324,7 +440,7 @@ pub fn chip(ui: &mut Ui, text: &str, font: FontId) -> Response {
 pub fn kbd(ui: &mut Ui, text: &str) -> Response {
     let t = tokens(ui);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), mono(10.5), t.muted);
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 10.0, 17.0), Sense::hover());
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + 10.0, sz(17.0)), Sense::hover());
     ui.painter().rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, t.line_strong), StrokeKind::Inside);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, t.muted);
     r
@@ -356,7 +472,7 @@ pub fn tab(ui: &mut Ui, text: &str, current: bool, italic: bool, mono_: bool) ->
     let mut rt = RichText::new(text).color(fg).font(match (mono_, current) {
         (true, _) => mono(12.5),
         (false, true) => semibold(13.0),
-        (false, false) => FontId::proportional(13.0),
+        (false, false) => prop(13.0),
     });
     if italic {
         rt = rt.italics();
@@ -372,7 +488,7 @@ pub fn tab(ui: &mut Ui, text: &str, current: bool, italic: bool, mono_: bool) ->
 /// Sidebar row: optional icon, label, optional count; filled with the accent tint when current.
 pub fn nav_item(ui: &mut Ui, icon_: Option<Icon>, label: &str, count: Option<&str>, current: bool, indent: f32) -> Response {
     let t = tokens(ui);
-    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), sz(30.0)), Sense::click());
     let fill = if current { t.accent_soft } else if r.hovered() { t.hover } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
     let fg = if current { t.text } else { mix(t.text, t.bg, 0.2) };
@@ -381,7 +497,7 @@ pub fn nav_item(ui: &mut Ui, icon_: Option<Icon>, label: &str, count: Option<&st
         paint_icon(ui, Rect::from_center_size(Pos2::new(x + 7.5, rect.center().y), Vec2::splat(15.0)), i, if current { t.accent } else { t.muted });
         x += 25.0;
     }
-    let font = if current { semibold(13.0) } else { FontId::proportional(13.0) };
+    let font = if current { semibold(13.0) } else { prop(13.0) };
     let mut right = rect.right() - 10.0;
     if let Some(c) = count {
         let g = ui.painter().layout_no_wrap(c.to_owned(), mono(11.5), if current { t.accent } else { t.dim });
@@ -436,10 +552,10 @@ pub fn badge(ui: &Ui, right_center: Pos2, text: &str, color: Color32) {
 /// One option of a segmented control; `dot` colors a status.
 pub fn segment(ui: &mut Ui, text: &str, dot_: Option<Color32>, on: bool) -> Response {
     let t = tokens(ui);
-    let font = if on { semibold(12.5) } else { FontId::proportional(12.5) };
+    let font = if on { semibold(12.5) } else { prop(12.5) };
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, if on { t.text } else { t.muted });
     let extra = if dot_.is_some() { 12.0 } else { 0.0 };
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + extra + 18.0, 24.0), Sense::click());
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + extra + 18.0, sz(24.0)), Sense::click());
     let fill = if on { t.tag } else if r.hovered() { t.hover } else { Color32::TRANSPARENT };
     ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     let mut x = rect.left() + 9.0;
@@ -459,12 +575,12 @@ pub fn pill_tab(ui: &mut Ui, icon_: Option<Icon>, text: &str, current: bool, mon
     let font = match (mono_, current) {
         (true, _) => mono(12.0),
         (false, true) => semibold(12.5),
-        (false, false) => FontId::proportional(12.5),
+        (false, false) => prop(12.5),
     };
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
     let lead = if icon_.is_some() { 20.0 } else { 0.0 };
     let trail = if closable { 20.0 } else { 0.0 };
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 20.0, 26.0), Sense::click_and_drag());
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 20.0, sz(26.0)), Sense::click_and_drag());
     let (fill, stroke) = if current {
         (t.accent_soft, Stroke::new(1.0, mix(t.bg, t.accent, 0.5)))
     } else {
@@ -570,6 +686,23 @@ mod tests {
         assert_eq!((v.iter().collect::<String>(), v[cur]), ("dacb".into(), 'b'));
         move_item(&mut v, 0, 1, &mut cur);
         assert_eq!((v.iter().collect::<String>(), v[cur]), ("adcb".into(), 'b'));
+    }
+
+    #[test]
+    fn areas_scale_fixed_fonts_and_restore() {
+        set_sizes(Sizes { logs: 1.5, tabs: 0.8, ..Default::default() });
+        assert_eq!(mono(12.0).size, 12.0); // outside any area
+        {
+            let _logs = area(Area::Logs);
+            assert_eq!(mono(12.0).size, 18.0);
+            {
+                let _tabs = area(Area::Tabs); // nested: its own size, not 1.5 × 0.8
+                assert!((sz(10.0) - 8.0).abs() < 1e-4);
+            }
+            assert_eq!(sz(10.0), 15.0);
+        }
+        assert_eq!(sz(10.0), 10.0);
+        set_sizes(Sizes::default());
     }
 
     #[test]

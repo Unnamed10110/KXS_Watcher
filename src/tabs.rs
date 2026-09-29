@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
 use egui::{Color32, FontId, RichText, TextStyle};
-use egui_term::{BackendSettings, PtyEvent, TerminalBackend, TerminalView};
+use egui_term::{BackendSettings, FontSettings, PtyEvent, TerminalBackend, TerminalFont, TerminalView};
 use futures::{AsyncBufReadExt, StreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ApiResource, LogParams};
@@ -1038,6 +1038,14 @@ pub struct TermTab {
     backend: TerminalBackend,
     /// Pod this terminal owns (node shell): deleted when the terminal goes away.
     pub cleanup: Option<Cleanup>,
+    /// Pass it was last drawn in: coming back on screen (opened, its tab picked) takes the keyboard.
+    drawn: u64,
+}
+
+thread_local! {
+    /// The terminal that takes the keyboard (backend id): the one opened, clicked or brought up
+    /// last, until a click somewhere else. Only one at a time, even with several on screen.
+    static KEYBOARD: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 pub type Command = (String, Vec<String>);
@@ -1049,19 +1057,52 @@ impl TermTab {
     pub fn new(ctx: &egui::Context, id: u64, title: String, (shell, args): Command) -> std::io::Result<Self> {
         let tx = TERM_TX.get().expect("terminal channel").clone();
         let settings = BackendSettings { shell, args, working_directory: kubeconfig::home() };
-        Ok(TermTab { title, backend: TerminalBackend::new(id, ctx.clone(), tx, settings)?, cleanup: None })
+        Ok(TermTab { title, backend: TerminalBackend::new(id, ctx.clone(), tx, settings)?, cleanup: None, drawn: 0 })
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        // egui_term only reads input while hovered, so focus follows the pointer.
-        let focus = ui.rect_contains_pointer(ui.max_rect());
-        let view = TerminalView::new(ui, &mut self.backend).set_focus(focus).set_size(ui.available_size());
-        ui.add(view);
+    /// Whether typing goes here (the app leaves its shortcuts to the terminal then).
+    pub fn has_keyboard(&self) -> bool {
+        KEYBOARD.with(|k| k.get()) == Some(self.backend.id())
+    }
+
+    /// `size`: the terminal's font size factor (Settings), on egui_term's 14 px.
+    pub fn ui(&mut self, ui: &mut egui::Ui, size: f32) {
+        let id = self.backend.id();
+        let area = ui.max_rect();
+        // Where a button went down this frame (a tap can press and release in one frame, so not
+        // `press_origin`, which is gone by then).
+        let press = ui.input(|i| i.events.iter().rev().find_map(|e| match e {
+            egui::Event::PointerButton { pressed: true, pos, .. } => Some(*pos),
+            _ => None,
+        }));
+        if let Some(p) = press {
+            if area.contains(p) {
+                KEYBOARD.with(|k| k.set(Some(id)));
+            } else if self.has_keyboard() {
+                KEYBOARD.with(|k| k.set(None)); // clicked elsewhere
+            }
+        }
+        let pass = ui.ctx().cumulative_pass_nr();
+        if self.drawn + 1 < pass {
+            KEYBOARD.with(|k| k.set(Some(id))); // just opened, or its tab was picked
+        }
+        self.drawn = pass;
+        let keys = self.has_keyboard();
+        let font = TerminalFont::new(FontSettings { font_type: FontId::monospace(14.0 * size) });
+        let view = TerminalView::new(ui, &mut self.backend).set_focus(keys).set_size(ui.available_size()).set_font(font);
+        let r = ui.add(view);
+        if keys {
+            let accent = crate::ui_kit::tokens(ui).accent;
+            ui.painter().rect_stroke(r.rect, 0.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+        }
     }
 }
 
 impl Drop for TermTab {
     fn drop(&mut self) {
+        if self.has_keyboard() {
+            KEYBOARD.with(|k| k.set(None));
+        }
         // ponytail: if the app is killed mid-session the pod stays until its 4h sleep ends.
         if let Some((client, ns, pod)) = self.cleanup.take() {
             tokio::spawn(ops::delete(client, ApiResource::erase::<Pod>(&()), ns, pod));
@@ -1203,7 +1244,7 @@ impl YamlTab {
                 egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, buf.as_str(), "yaml")
             } else {
                 // ponytail: no highlighting for huge objects; syntect gets slow past ~200KB.
-                LayoutJob::simple(buf.as_str().to_owned(), FontId::monospace(13.0), ui.visuals().text_color(), f32::INFINITY)
+                LayoutJob::simple(buf.as_str().to_owned(), TextStyle::Monospace.resolve(ui.style()), ui.visuals().text_color(), f32::INFINITY)
             };
             if let Some(m) = &matcher {
                 find::overlay(&mut job, &m.ranges(buf.as_str()), Some(cur)); // from `buf`: `self.text` may be a frame stale

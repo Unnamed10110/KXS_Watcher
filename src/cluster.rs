@@ -132,7 +132,7 @@ fn stat_card(ui: &mut Ui, title: &str, value: &str, sub: &str, frac: Option<f32>
             Some(f) => ui_kit::bar(ui, f, w, if f > 0.85 { RED } else { t.accent }),
             None => ui.allocate_exact_size(egui::vec2(w, 6.0), egui::Sense::hover()).1,
         };
-        ui.add(egui::Label::new(RichText::new(foot).size(12.0).color(t.dim)).truncate());
+        ui.add(egui::Label::new(RichText::new(foot).size(ui_kit::sz(12.0)).color(t.dim)).truncate());
     });
 }
 
@@ -831,7 +831,7 @@ impl Ready {
         let t = ui_kit::tokens(ui);
         let (mut nav, mut nav_ns) = (None, false);
         let nav_frame = egui::Frame::new().fill(t.chrome).inner_margin(egui::Margin::symmetric(8, 0)).stroke(egui::Stroke::new(1.0, t.line));
-        egui::Panel::left(egui::Id::new(("nav", self.kctx.id()))).resizable(true).default_size(240.0).size_range(190.0..=400.0).frame(nav_frame).show(ui, |ui| (nav, nav_ns) = self.nav(ui, out));
+        egui::Panel::left(egui::Id::new(("nav", self.kctx.id()))).resizable(true).default_size(240.0).size_range(190.0..=400.0).frame(nav_frame).show(ui, |ui| (nav, nav_ns) = ui_kit::scaled(ui, ui_kit::Area::Sidebar, |ui| self.nav(ui, out)));
         if let Some((p, pin)) = nav {
             self.show_page(&ctx, p, pin);
         }
@@ -840,16 +840,19 @@ impl Ready {
         let (mut acts, mut ev) = (Vec::new(), PageEv::default());
         let mut pages = std::mem::take(&mut self.pages);
         egui::Panel::top(egui::Id::new(("tabs", self.kctx.id()))).frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 8, right: 12, top: 0, bottom: 2 })).show(ui, |ui| {
-            self.page_tabs_ui(ui, &mut pages);
-            if let Some(pt) = pages.get_mut(self.cur) {
-                self.subtabs_ui(ui, pt);
+            {
+                let _tabs = ui_kit::area(ui_kit::Area::Tabs);
+                self.page_tabs_ui(ui, &mut pages);
+                if let Some(pt) = pages.get_mut(self.cur) {
+                    self.subtabs_ui(ui, pt);
+                }
             }
             self.find.bar(ui, |_| false);
         });
         match pages.get_mut(self.cur) {
             Some(pt) => {
                 self.panel_ui(ui, pt, &mut acts);
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 10, bottom: 8 })).show(ui, |ui| self.page_ui(ui, pt, out, &mut acts, &mut ev));
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 10, bottom: 8 })).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Lists, |ui| self.page_ui(ui, pt, out, &mut acts, &mut ev)));
             }
             None => {
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -899,7 +902,7 @@ impl Ready {
         } else if let Some(t) = pt.subs.get_mut(pt.active - 1) {
             let mut dacts = vec![];
             // Object tabs share widget ids (grids, collapsing headers): keep their state apart.
-            ui.push_id(t.id, |ui| t.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.find, true));
+            ui.push_id(t.id, |ui| ui_kit::scaled(ui, ui_kit::Area::Details, |ui| t.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.find, true)));
             acts.extend(dacts.into_iter().map(|a| (vec![t.details.t.clone()], a)));
         }
     }
@@ -915,7 +918,7 @@ impl Ready {
         let max = (ui.available_width() - 360.0).max(320.0);
         let t = ui_kit::tokens(ui);
         let frame = egui::Frame::new().fill(t.panel).inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 8 }).stroke(egui::Stroke::new(1.0, t.line));
-        let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| {
+        let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Details, |ui| {
             ui.horizontal(|ui| {
                 ui_kit::section_label(ui, &p.details.t.kind.ar.kind);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -930,7 +933,7 @@ impl Ready {
             // "hidden matches" without being revealed), references, events and the YAML.
             self.panel_find.bar(ui, |_| false);
             ui.push_id(p.id, |ui| p.details.ui(ui, &self.metrics.lock().unwrap(), &mut dacts, &mut self.panel_find, false));
-        });
+        }));
         self.panel_hovered = ui.ctx().pointer_hover_pos().is_some_and(|pos| shown.response.rect.contains(pos));
         let t = p.details.t.clone();
         acts.extend(dacts.into_iter().map(|a| (vec![t.clone()], a)));
@@ -952,7 +955,7 @@ impl Ready {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal().id_salt(("pagetabs", self.kctx.id())).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.set_height(38.0);
+                    ui.set_height(ui_kit::sz(38.0));
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let mut items = vec![];
                     for (i, pt) in pages.iter_mut().enumerate() {
@@ -1156,7 +1159,7 @@ impl Ready {
                 ui.add(egui::Label::new(RichText::new(self.alias.as_deref().unwrap_or(&self.kctx.name)).font(ui_kit::semibold(14.0)).color(t.text)).truncate()).on_hover_text(&self.kctx.name);
                 ui.horizontal(|ui| {
                     ui_kit::dot(ui, GREEN, 3.0);
-                    ui.add(egui::Label::new(RichText::new(format!("Connected · {}", self.version)).size(11.5).color(t.muted)).truncate());
+                    ui.add(egui::Label::new(RichText::new(format!("Connected · {}", self.version)).size(ui_kit::sz(11.5)).color(t.muted)).truncate());
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1227,7 +1230,7 @@ impl Ready {
                 for (group, kinds) in &self.custom {
                     ui.horizontal(|ui| {
                         ui.add_space(28.0);
-                        ui.label(RichText::new(group).size(11.5).color(t.dim));
+                        ui.label(RichText::new(group).size(ui_kit::sz(11.5)).color(t.dim));
                     });
                     for k in kinds {
                         item(ui, None, &k.ar.kind, None, kind_page(group, &k.ar.kind), 28.0);
@@ -1439,7 +1442,8 @@ impl Ready {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if let Some(l) = &mut pt.list {
-                let r = ui_kit::search_field(ui, &mut l.search, "Filter by name, label or node", Some("Ctrl F"), 280.0);
+                let r = ui_kit::search_field(ui, &mut l.search, "Filter by name, label or node", Some("Ctrl F"), 280.0)
+                    .on_hover_text("jpts*|ingenico*|as400* keeps whatever contains jpts, ingenico or as400 (| or, * anything)");
                 if std::mem::take(&mut self.focus_filter) {
                     r.request_focus();
                 }
@@ -1703,7 +1707,7 @@ impl Ready {
                                     }
                                 }
                             }
-                            ui.add(egui::Label::new(RichText::new(cell(r, msg_i)).size(12.5).color(t.muted)).wrap());
+                            ui.add(egui::Label::new(RichText::new(cell(r, msg_i)).size(ui_kit::sz(12.5)).color(t.muted)).wrap());
                         }
                         if warn_rows.len() > 8 {
                             ui.label(RichText::new(format!("{} more under Events", warn_rows.len() - 8)).color(t.dim));
@@ -1736,7 +1740,7 @@ impl Ready {
                             ui.set_min_height(130.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    if ui.link(RichText::new(format!("{} ({})", label(&l.kind), d.rows.len())).strong().size(16.0)).clicked() {
+                                    if ui.link(RichText::new(format!("{} ({})", label(&l.kind), d.rows.len())).strong().size(ui_kit::sz(16.0))).clicked() {
                                         goto = Some(kind_page(&l.kind.ar.group, &l.kind.ar.kind));
                                     }
                                     if !d.synced && d.error.is_none() {

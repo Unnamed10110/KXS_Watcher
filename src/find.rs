@@ -19,6 +19,17 @@ impl Matcher {
         Matcher { re: None, needle: needle.to_string(), case }
     }
 
+    /// Filter-box text, like Lens: `|` separates alternatives and `*` stands for anything, so
+    /// `jpts*|ingenico*|as400*` keeps whatever contains jpts, ingenico or as400. Case-insensitive;
+    /// without `|` or `*` it is plain text.
+    pub fn wildcard(query: &str) -> Self {
+        if !query.contains(['|', '*']) {
+            return Matcher::plain(query, false);
+        }
+        let alts: Vec<String> = query.split('|').map(str::trim).filter(|a| !a.is_empty()).map(|a| a.split('*').map(regex::escape).collect::<Vec<_>>().join(".*")).collect();
+        Matcher::regex(&alts.join("|"), false).unwrap_or_else(|_| Matcher::plain(query, false))
+    }
+
     pub fn regex(pattern: &str, case: bool) -> Result<Self, String> {
         let re = regex::RegexBuilder::new(pattern).case_insensitive(!case).build().map_err(|e| e.to_string())?;
         Ok(Matcher { re: Some(re), needle: String::new(), case })

@@ -114,6 +114,8 @@ struct Settings {
     aliases: HashMap<String, String>,
     /// The cluster shown at exit (context id).
     current: Option<String>,
+    /// Font size of the tabs, sidebar, lists, details, logs, editor and terminal.
+    sizes: ui_kit::Sizes,
 }
 
 /// Cluster colors, readable on dark and light themes. Rose is last, so red stays a deliberate pick (prod).
@@ -161,6 +163,7 @@ impl Default for Settings {
             accents: HashMap::new(),
             aliases: HashMap::new(),
             current: None,
+            sizes: ui_kit::Sizes::default(),
         }
     }
 }
@@ -190,8 +193,8 @@ struct App {
     show_settings: bool,
     settings_page: SettingsPage,
     paths_text: String,
-    /// Pointer was over a terminal last frame: leave Ctrl+K/F to the shell.
-    term_hovered: bool,
+    /// A terminal on screen had the keyboard last frame: leave Ctrl+K/F/T/W/Tab to the shell.
+    term_keys: bool,
     /// Custom accent window open for this context: (id, name).
     custom_accent: Option<(String, String)>,
     /// A cluster tab being renamed: (context id, text, focus requested).
@@ -231,9 +234,12 @@ struct Viewer<'a> {
     /// Ctrl+K (`Some(false)`) / Ctrl+F (`Some(true)`) this frame: the tab under the pointer takes it.
     find_req: Option<bool>,
     claimed: bool,
-    term_hovered: bool,
+    /// A terminal drawn this frame has the keyboard.
+    term_keys: bool,
     /// The dock tab under the pointer (Ctrl+W closes it).
     hovered: Option<u64>,
+    /// Tab title size (Settings › font size of tabs).
+    tab_font: f32,
     accents: &'a HashMap<String, Color32>,
 }
 
@@ -253,8 +259,9 @@ impl TabViewer for Viewer<'_> {
             Body::Term(x) => format!("⌨ {}", x.title),
             Body::Yaml(y) => format!("📝 {}", y.title),
         };
+        let text = RichText::new(text).size(self.tab_font);
         match self.accent(t) {
-            Some(c) => RichText::new(text).color(c).into(),
+            Some(c) => text.color(c).into(),
             None => text.into(),
         }
     }
@@ -275,7 +282,7 @@ impl TabViewer for Viewer<'_> {
 
     fn ui(&mut self, ui: &mut Ui, t: &mut Tab) {
         let hovered = ui.rect_contains_pointer(ui.max_rect());
-        self.term_hovered |= hovered && matches!(t.body, Body::Term(_));
+        self.term_keys |= matches!(&t.body, Body::Term(x) if x.has_keyboard());
         if hovered {
             self.hovered = Some(t.id);
         }
@@ -287,9 +294,9 @@ impl TabViewer for Viewer<'_> {
         }
         match &mut t.body {
             Body::Cluster(c) => c.ui(ui, self.out),
-            Body::Logs(l) => l.ui(ui),
-            Body::Term(x) => x.ui(ui),
-            Body::Yaml(y) => y.ui(ui),
+            Body::Logs(l) => ui_kit::scaled(ui, ui_kit::Area::Logs, |ui| l.ui(ui)),
+            Body::Term(x) => x.ui(ui, ui_kit::factor(ui_kit::Area::Terminal)),
+            Body::Yaml(y) => ui_kit::scaled(ui, ui_kit::Area::Editor, |ui| y.ui(ui)),
         }
     }
 
@@ -302,6 +309,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, term_rx: Receiver<(u64, PtyEvent)>) -> Self {
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let fonts = theme::install_fonts(&cc.egui_ctx, &settings.mono_font);
+        alt_codes::CTX.set(cc.egui_ctx.clone()).ok();
         settings.apply_look(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(settings.zoom);
         let window = cc.storage.and_then(|s| s.get_string("window"));
@@ -324,7 +332,7 @@ impl App {
             show_catalog: false,
             show_settings: false,
             settings_page: SettingsPage::Appearance,
-            term_hovered: false,
+            term_keys: false,
             custom_accent: None,
             renaming: None,
             picking: None,
@@ -601,6 +609,7 @@ impl App {
             ui.add_space(4.0);
             let n = self.clusters.len();
             let mut items = vec![];
+            let tabs_size = ui_kit::area(ui_kit::Area::Tabs); // the cluster pills are tabs too
             for (i, tab) in self.clusters.iter().enumerate() {
                 let Some(c) = Self::cluster_of(tab) else { continue };
                 let id = c.kctx.id();
@@ -673,6 +682,7 @@ impl App {
                     }
                 });
             }
+            drop(tabs_size);
             if let Some(m) = ui_kit::reorder(ui, &items) {
                 moved = Some(m);
             }
@@ -851,6 +861,24 @@ impl App {
                                 ui.label(RichText::new(format!("Interface font: {} · install Geist or JetBrains Mono and they are picked up on the next start.", self.fonts.0)).small().color(t.dim));
                                 ui.add_space(12.0);
                                 ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Font size by area").font(ui_kit::semibold(14.0)));
+                                    ui.label(RichText::new("On top of the text size; the rest of the window keeps it.").color(t.muted));
+                                });
+                                ui.add_space(4.0);
+                                egui::Grid::new("area-sizes").num_columns(3).spacing([18.0, 6.0]).show(ui, |ui| {
+                                    for (area, name, what) in ui_kit::Area::ALL {
+                                        ui.label(name);
+                                        let v = self.settings.sizes.get_mut(area);
+                                        ui.add(egui::Slider::new(v, 0.7..=1.6).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)).custom_parser(|s| s.trim_end_matches(['%', ' ']).parse::<f64>().ok().map(|p| p / 100.0)));
+                                        ui.label(RichText::new(what).color(t.muted));
+                                        ui.end_row();
+                                    }
+                                });
+                                if self.settings.sizes != ui_kit::Sizes::default() && ui_kit::button(ui, Btn::Ghost, None, "Reset font sizes").clicked() {
+                                    self.settings.sizes = ui_kit::Sizes::default();
+                                }
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
                                     ui.label(RichText::new("Cluster colors").font(ui_kit::semibold(14.0)));
                                     ui.label(RichText::new("Tabs, selections, logs and terminals of a cluster take its color.").color(t.muted));
                                 });
@@ -1002,10 +1030,10 @@ impl App {
 /// A cluster in the top bar: color dot, name, close button. Returns (pill, close).
 fn cluster_pill(ui: &mut Ui, name: &str, accent: Color32, current: bool) -> (egui::Response, egui::Response) {
     let t = ui_kit::tokens(ui);
-    let font = if current { ui_kit::semibold(13.0) } else { FontId::proportional(13.0) };
+    let font = if current { ui_kit::semibold(13.0) } else { ui_kit::prop(13.0) };
     let fg = if current { t.text } else { t.muted };
     let galley = ui.painter().layout_no_wrap(name.to_owned(), font, fg);
-    let (rect, main) = ui.allocate_exact_size(vec2(galley.size().x + 50.0, 30.0), Sense::click_and_drag());
+    let (rect, main) = ui.allocate_exact_size(vec2(galley.size().x + 50.0, ui_kit::sz(30.0)), Sense::click_and_drag());
     let fill = if current { mix(t.chrome, accent, if t.neon { 0.1 } else { 0.16 }) } else if main.hovered() { t.hover } else { Color32::TRANSPARENT };
     let stroke = if current { Stroke::new(1.0, if t.neon { accent } else { mix(t.chrome, accent, 0.5) }) } else { Stroke::NONE };
     ui.painter().rect(rect, CornerRadius::same(8), fill, stroke, StrokeKind::Inside);
@@ -1049,19 +1077,79 @@ fn swatch(ui: &mut Ui, color: Color32, on: bool) -> egui::Response {
     r
 }
 
+/// Windows Alt codes (Alt + 1 2 4 on the numpad types `|`): Windows sends the character after Alt
+/// is released, when winit has no key event left to attach it to, so winit drops it. A message
+/// hook catches it and `raw_input_hook` hands it to egui as typed text.
+mod alt_codes {
+    use std::cell::Cell;
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    pub static TYPED: Mutex<String> = Mutex::new(String::new());
+    pub static CTX: OnceLock<egui::Context> = OnceLock::new();
+
+    thread_local! {
+        /// The last keyboard message was Alt going up.
+        static ALT_UP: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The start of the Win32 MSG the hook gets.
+    #[repr(C)]
+    struct Msg {
+        hwnd: *mut c_void,
+        message: u32,
+        wparam: usize,
+    }
+
+    const WM_KEYFIRST: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_SYSKEYUP: u32 = 0x0105;
+    const WM_KEYLAST: u32 = 0x0109;
+    const VK_MENU: usize = 0x12;
+
+    /// Sees every message before winit; never swallows one.
+    pub fn hook(msg: *const c_void) -> bool {
+        // SAFETY: winit passes a valid `*const MSG` for each message it takes from the queue.
+        let m = unsafe { &*(msg as *const Msg) };
+        match m.message {
+            WM_KEYUP | WM_SYSKEYUP => ALT_UP.with(|a| a.set(m.wparam == VK_MENU)),
+            WM_CHAR if ALT_UP.with(|a| a.replace(false)) => {
+                if let Some(c) = char::from_u32(m.wparam as u32).filter(|c| !c.is_control()) {
+                    TYPED.lock().unwrap().push(c);
+                    if let Some(ctx) = CTX.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            WM_KEYFIRST..=WM_KEYLAST => ALT_UP.with(|a| a.set(false)),
+            _ => {}
+        }
+        false
+    }
+}
+
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let typed = std::mem::take(&mut *alt_codes::TYPED.lock().unwrap());
+        if !typed.is_empty() {
+            raw_input.events.push(egui::Event::Text(typed));
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ui_kit::set_sizes(self.settings.sizes);
         // First thing: text fields would treat Ctrl+K as "delete to end of line".
         const FIND_K: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
         const FIND_F: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
         const NEW_TAB: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::T);
-        let mut find_req = match self.term_hovered {
+        let mut find_req = match self.term_keys {
             true => None,
             false => ui.input_mut(|i| if i.consume_shortcut(&FIND_K) { Some(false) } else { i.consume_shortcut(&FIND_F).then_some(true) }),
         };
         // Ctrl+T: a new tab in the current cluster; with none open, the cluster list.
-        if !self.term_hovered && ui.input_mut(|i| i.consume_shortcut(&NEW_TAB)) {
+        if !self.term_keys && ui.input_mut(|i| i.consume_shortcut(&NEW_TAB)) {
             match self.clusters.get_mut(self.cur).map(|t| &mut t.body) {
                 Some(Body::Cluster(c)) => c.new_tab(),
                 _ => self.show_catalog = true,
@@ -1070,7 +1158,7 @@ impl eframe::App for App {
         // Ctrl+W (after the dock is drawn: it may be the one under the pointer), Ctrl+Tab /
         // Ctrl+Shift+Tab for the next / previous tab, Ctrl+1…8 for cluster N and Ctrl+9 for the last.
         let mut close_req = false;
-        if !self.term_hovered {
+        if !self.term_keys {
             use egui::{Key, Modifiers};
             const NUMS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
             let (close, step, num) = ui.input_mut(|i| {
@@ -1105,13 +1193,15 @@ impl eframe::App for App {
 
         let mut out = Out { node_image: self.settings.node_shell_image.clone(), ..Default::default() };
         let accents = self.settings.accents.clone();
-        let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_hovered: false, hovered: None, accents: &accents };
+        let tab_font = self.settings.text_size * ui_kit::factor(ui_kit::Area::Tabs);
+        let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_keys: false, hovered: None, tab_font, accents: &accents };
         let mut dock_hovered = false;
         if self.dock.iter_all_tabs().next().is_some() {
             let max = (ui.available_height() - 200.0).max(160.0);
             dock_hovered = egui::Panel::bottom("dock").resizable(true).default_size(280.0).size_range(120.0..=max).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
                 let mut style = Style::from_egui(ui.style());
                 style.tab_bar.bg_fill = t.chrome;
+                style.tab_bar.height = (24.0 * ui_kit::factor(ui_kit::Area::Tabs)).max(20.0);
                 style.tab_bar.hline_color = t.line;
                 style.tab.tab_body.bg_fill = t.chrome;
                 style.tab.tab_body.stroke = Stroke::NONE;
@@ -1128,8 +1218,8 @@ impl eframe::App for App {
             .response
             .contains_pointer();
         }
-        let (claimed, term_hovered, hovered_tab) = (viewer.claimed, viewer.term_hovered, viewer.hovered);
-        self.term_hovered = term_hovered;
+        let (claimed, term_keys, hovered_tab) = (viewer.claimed, viewer.term_keys, viewer.hovered);
+        self.term_keys = term_keys;
         // Ctrl+W: the dock tab under the pointer (or the focused one), else the cluster's current tab.
         if close_req && dock_hovered {
             if let Some(path) = hovered_tab.or_else(|| self.dock.find_active_focused().map(|(_, t)| t.id)).and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
@@ -1209,6 +1299,10 @@ fn main() -> eframe::Result {
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::render(256), width: 256, height: 256 }))
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 560.0]),
+        event_loop_builder: Some(Box::new(|b| {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            b.with_msg_hook(alt_codes::hook);
+        })),
         ..Default::default()
     };
     eframe::run_native("KXS Watcher", options, Box::new(move |cc| Ok(Box::new(App::new(cc, rx)))))

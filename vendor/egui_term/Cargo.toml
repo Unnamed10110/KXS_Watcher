@@ -1,0 +1,15 @@
+# egui_term (https://github.com/Harzu/egui_term, rev 31bbc7a, MIT), patched for KXS Watcher: see
+# KXS_PATCH.md. The upstream workspace and its examples are left out.
+[package]
+name = "egui_term"
+description = "Terminal emulator widget powered by EGUI framework and alacritty terminal backend."
+authors = ["Ilya Shvyryalkin <ilyashvy@gmail.com>"]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+egui = "0.35"
+alacritty_terminal = "0.26"
+anyhow = "1.0.100"
+open = "5.3.2"

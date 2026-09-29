@@ -24,7 +24,9 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   Files edited, added or removed on disk (kubectl config, other tools) update the list within seconds.
 - **Live lists** for every resource kind, including CRDs, built from the API server's Table
   output (the same columns as `kubectl get`, `Wide` = `-o wide`). Multi-namespace filter, search, sort,
-  status colors, CPU/memory columns for pods and nodes (metrics-server).
+  status colors, CPU/memory columns for pods and nodes (metrics-server). The filter works like Lens:
+  `jpts*|ingenico*|as400*` keeps whatever contains jpts, ingenico or as400 (`|` or, `*` anything);
+  `.*` switches to a full regular expression. Alt codes (Alt+124 for `|`) type in every text box.
 - **Multi-select**: checkboxes, Ctrl/Shift+click, Ctrl+A. Bulk open, merged logs, restart, scale,
   edit YAML, copy names, delete (one confirmation, one summary).
 - **Object sub-tabs** inside each cluster tab (double-click a row). Details per kind link to
@@ -49,6 +51,8 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   object with the same text highlighted.
 - **Themes**: Dark, Light, System, AMOLED in eight neon colors (cyan, red, green, purple, pink,
   blue, yellow, orange: pure black, only the accent lights up), Crimson, Forest, Ocean and Violet.
+- **Font size by area** (Settings › Appearance): tabs, sidebar, lists and pages, details, logs, YAML
+  editor and terminal each from 70 % to 160 % of the text size; the rest of the window keeps it.
 - **Tabs**: Ctrl+T (or "+" after the page tabs) opens a new tab: type to pick a view or resource list.
   Drag tabs (clusters, pages, objects) to reorder them; double-click a cluster or page tab to rename it
   (right-click: rename, reset name, move left/right). Ctrl+W closes the tab (the object tab shown,
@@ -66,6 +70,8 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   terminals and editors opened from it. New clusters get a free color (a neon one under AMOLED); right-click a
   cluster pill or context for soft and neon swatches or any custom color.
 - **Dock tabs**: logs, pod shell, local terminal pinned to a context (no credentials copied), YAML editor.
+  A terminal takes the keyboard when it opens, when its tab is picked or when clicked (accent outline),
+  wherever the mouse is; a click elsewhere gives it back (patched egui_term in `vendor/egui_term`).
 - **Overview**: cluster CPU/memory/pods, per-node usage, live warning events (repeats grouped);
   workloads overview.
 - **Helm**: releases, values/manifest/notes, history, rollback, uninstall.

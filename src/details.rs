@@ -825,7 +825,7 @@ impl Details {
         let can_edit = self.t.kind.can("update");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            find::label(ui, RichText::new("Data").strong().size(15.0));
+            find::label(ui, RichText::new("Data").strong().size(ui_kit::sz(15.0)));
             if secret {
                 find::label(ui, RichText::new(format!("({})", s(&obj["type"]))).weak());
             }

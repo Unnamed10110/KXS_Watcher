@@ -10,8 +10,11 @@ egui = "0.35.0"
 # ponytail: needs OpenGL 3+; switch back to "wgpu" for GPU-less RDP/VM hosts if that matters.
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
 egui_extras = { version = "0.35.0", default-features = false, features = ["syntect"] }
+# eframe's own winit, for its Windows message hook (Alt codes, see `alt_codes` in main.rs).
+winit = { version = "0.30", default-features = false }
 egui_dock = "0.20.1"
-egui_term = { git = "https://github.com/Harzu/egui_term", rev = "31bbc7ab8503c9518fcee5717cfa29011e59f451" }
+# egui_term rev 31bbc7a: typing reaches the focused terminal wherever the pointer is (vendor/egui_term/KXS_PATCH.md).
+egui_term = { path = "vendor/egui_term" }
 kube = "4.2.0"
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "process", "io-util", "macros"] }
