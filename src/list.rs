@@ -47,6 +47,9 @@ pub struct List {
     pub filter_error: Option<String>,
     /// Pods: show only this status bucket (`pod_bucket`).
     pub status: Option<&'static str>,
+    /// The filter as a matcher (to highlight it in the cells) and its matches in the rows shown.
+    filter_m: Option<Matcher>,
+    pub filter_hits: usize,
     pub sort: Option<(DCol, bool)>,
     /// Selected rows by uid (survives re-sorts and watch updates).
     pub sel: HashSet<String>,
@@ -117,7 +120,7 @@ impl List {
             .into_iter()
             .map(|ns| Bg::spawn(watch::run(client.clone(), kind.ar.clone(), ns, fields.map(String::from), data.clone(), ctx.clone())))
             .collect();
-        List { kind, data, _watches: watches, view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None, status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default() }
+        List { kind, data, _watches: watches, view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None, status: None, filter_m: None, filter_hits: 0, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default() }
     }
 
     fn is_pods(&self) -> bool {
@@ -287,6 +290,8 @@ impl List {
                 if asc { o } else { o.reverse() }
             }),
         }
+        self.filter_hits = filt.as_ref().map_or(0, |f| self.view.iter().map(|r| r.cells.iter().chain([&r.namespace]).chain(&r.images).map(|c| f.ranges(c).len()).sum::<usize>()).sum());
+        self.filter_m = filt;
         // Drop selections of rows that are gone.
         let live: HashSet<&String> = d.rows.keys().collect();
         self.sel.retain(|u| live.contains(u));
@@ -446,7 +451,12 @@ impl List {
                                 let b = status_i.and_then(|i| r.cells.get(i)).map_or("Running", |s| pod_bucket(s));
                                 ui_kit::dot(ui, bucket_color(b), 3.5);
                             }
-                            let hits = matcher.as_ref().map(|mt| mt.ranges(&text)).unwrap_or_default();
+                            // Ctrl+K matches, else the filter's (never current: they're not stepped through).
+                            let mut hits = matcher.as_ref().map(|mt| mt.ranges(&text)).unwrap_or_default();
+                            let find_hits = !hits.is_empty();
+                            if !find_hits {
+                                hits = self.filter_m.as_ref().map(|f| f.ranges(&text)).unwrap_or_default();
+                            }
                             if hits.is_empty() && *c == DCol::Images && !text.is_empty() {
                                 image_cell(ui, &text, tk.muted, tk.text);
                             } else if hits.is_empty() && !r.deleting && matches!(name.as_str(), "Status" | "Phase") && status.is_some() && !text.is_empty() {
@@ -457,7 +467,7 @@ impl List {
                                 ui.add(egui::Label::new(rt).truncate().selectable(false));
                             } else {
                                 let mut job = (*egui::WidgetText::from(rt).into_layout_job(ui.style(), egui::FontSelection::Default, egui::Align::Center)).clone();
-                                let cur = (cur_row == Some(i)).then_some(0);
+                                let cur = (find_hits && cur_row == Some(i)).then_some(0);
                                 find::overlay(&mut job, &hits, cur);
                                 ui.add(egui::Label::new(job).truncate().selectable(false));
                             }
@@ -549,7 +559,7 @@ mod tests {
         let kind = Kind { ar: kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&()), namespaced: true, verbs: vec![] };
         let mut l = List {
             kind, data: Default::default(), _watches: vec![], view: vec![], key: None, search: String::new(), filter_re: true, filter_error: None,
-            status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
+            status: None, filter_m: None, filter_hits: 0, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
         };
         let mut d = ListData::default();
         for n in ["argocd-redis-ha-server-0", "argocd-redis-ha-haproxy-x", "argocd-server-1"] {
@@ -578,7 +588,7 @@ mod tests {
         let kind = Kind { ar: kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&()), namespaced: true, verbs: vec![] };
         let mut l = List {
             kind, data: Default::default(), _watches: vec![], view: vec![], key: None, search: String::new(), filter_re: false, filter_error: None,
-            status: None, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
+            status: None, filter_m: None, filter_hits: 0, sort: None, sel: HashSet::new(), anchor: None, groups: HashMap::new(), find_rows: vec![], find_key: None, grouped: Default::default(),
         };
         let mut d = ListData::default();
         for n in ["jpts-pos-1-55d6", "api-ingenico-gw", "AS400-proxy", "feitian-x", "api-cnp"] {
@@ -592,6 +602,7 @@ mod tests {
             let mut names: Vec<&str> = l.view.iter().map(|r| r.name.as_str()).collect();
             names.sort();
             assert_eq!(names, ["AS400-proxy", "api-ingenico-gw", "jpts-pos-1-55d6"], "regex {re}");
+            assert_eq!(l.filter_hits, 3, "one match per name, regex {re}");
         }
         (l.filter_re, l.search) = (false, " | ".into()); // nothing but separators: everything
         l.refresh(&d, &m);

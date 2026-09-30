@@ -162,8 +162,12 @@ impl Find {
     }
 }
 
+/// Find and filter highlights: the current match solid amber, the others translucent amber and
+/// underlined, so every occurrence stands out.
+pub const HIT: Color32 = Color32::from_rgb(255, 176, 32);
+
 pub fn hit_bg(current: bool) -> Color32 {
-    if current { Color32::from_rgb(255, 140, 0) } else { Color32::from_rgba_unmultiplied(255, 210, 0, 80) }
+    if current { HIT } else { Color32::from_rgba_unmultiplied(255, 176, 32, 78) }
 }
 
 /// Give `hits` (byte ranges into `job.text`) a highlight background; `cur` is the current hit.
@@ -188,7 +192,9 @@ pub fn overlay(job: &mut LayoutJob, hits: &[Range<usize>], cur: Option<usize>) {
             if on {
                 format.background = hit_bg(cur == Some(h));
                 if cur == Some(h) {
-                    format.color = Color32::BLACK; // readable on the solid orange
+                    format.color = Color32::BLACK; // readable on the solid amber
+                } else {
+                    format.underline = egui::Stroke::new(2.0, HIT);
                 }
             }
             out.push(LayoutSection { leading_space: std::mem::take(&mut lead), byte_range: ByteIndex(a)..ByteIndex(end), format });
@@ -285,8 +291,8 @@ pub fn masked(ui: &mut Ui, text: &str) -> egui::Response {
     ui.horizontal(|ui| {
         ui.label(dots);
         let n = hits.len();
-        let tag = RichText::new(format!(" {n} hidden match{}, Show to see ", if n == 1 { "" } else { "es" })).background_color(hit_bg(cur.is_some()));
-        let r = ui.label(if cur.is_some() { tag.color(Color32::BLACK) } else { tag });
+        let tag = RichText::new(format!(" 🔒 {n} hidden match{} · Show to see ", if n == 1 { "" } else { "es" })).strong().background_color(hit_bg(cur.is_some()));
+        let r = ui.label(if cur.is_some() { tag.color(Color32::BLACK) } else { tag.color(HIT) });
         if scroll {
             ui.scroll_to_rect(r.rect, Some(Align::Center));
         }

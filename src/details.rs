@@ -252,15 +252,61 @@ fn chip(ui: &mut Ui, text: &str, color: Option<Color32>) -> egui::Response {
     })
 }
 
-fn section(ui: &mut Ui, title: &str) {
-    ui.add_space(14.0);
-    let dim = ui_kit::tokens(ui).dim;
-    find::label(ui, RichText::new(title.to_uppercase()).font(ui_kit::semibold(11.5)).color(dim).extra_letter_spacing(0.8));
-    ui.add_space(2.0);
+/// How far a section's frame reaches out of the content (the content is inset this much).
+const FRAME_OUT: f32 = 10.0;
+
+thread_local! {
+    /// The section being drawn: (top-left of its header, right edge). Its frame is drawn when the
+    /// next one starts or at `end_sections`: only then is its height known.
+    static OPEN: std::cell::Cell<Option<(egui::Pos2, f32)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Frames the last section.
+fn end_sections(ui: &mut Ui) {
+    if let Some((top_left, right)) = OPEN.with(|o| o.take()) {
+        ui.add_space(8.0);
+        let rect = egui::Rect::from_min_max(top_left, egui::pos2(right, ui.cursor().top()));
+        ui.painter().rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, ui_kit::tokens(ui).line_strong), egui::StrokeKind::Inside);
+    }
+}
+
+/// A titled block: a tinted header band with a color mark, framed down to the next section.
+fn section(ui: &mut Ui, title: &str) {
+    section_with(ui, title, None);
+}
+
+/// Same, with a summary on the right of the header (a count, a state).
+fn section_with(ui: &mut Ui, title: &str, summary: Option<(String, Color32)>) {
+    end_sections(ui);
+    ui.add_space(12.0);
+    let t = ui_kit::tokens(ui);
+    let mark = match title.split([' ', ':']).next().unwrap_or("").to_lowercase().as_str() {
+        "references" => ORANGE,
+        "container" | "init" => Color32::from_rgb(34, 211, 238),
+        "conditions" => summary.as_ref().map_or(GREEN, |s| s.1),
+        "events" => t.dim,
+        _ => t.accent,
+    };
+    let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ui_kit::sz(32.0)), egui::Sense::hover());
+    let (left, right) = (row.left() - FRAME_OUT, row.right() + FRAME_OUT);
+    let band = egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()));
+    let p = ui.painter();
+    p.rect_filled(band, egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, t.raise);
+    p.hline(band.x_range(), band.bottom(), egui::Stroke::new(1.0, t.line));
+    p.rect_filled(egui::Rect::from_center_size(egui::pos2(left + 12.0, band.center().y), egui::vec2(3.0, 14.0)), 1.5, mark);
+    let head = RichText::new(title.to_uppercase()).font(ui_kit::semibold(11.5)).color(t.text).extra_letter_spacing(0.8);
+    let galley = egui::WidgetText::from(head).into_galley(ui, Some(egui::TextWrapMode::Truncate), band.width() - 40.0, egui::TextStyle::Body);
+    ui.painter().galley(egui::pos2(left + 22.0, band.center().y - galley.size().y / 2.0), galley, t.text);
+    if let Some((text, color)) = summary {
+        ui.painter().text(egui::pos2(right - 12.0, band.center().y), egui::Align2::RIGHT_CENTER, text, ui_kit::semibold(12.0), color);
+    }
+    OPEN.with(|o| o.set(Some((band.min, right))));
+    ui.add_space(6.0);
+}
+
+/// Key / value rows, striped so each row reads on its own.
 fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
-    egui::Grid::new(id).num_columns(2).spacing([16.0, 7.0]).min_col_width(110.0).show(ui, add);
+    egui::Grid::new(id).num_columns(2).striped(true).spacing([16.0, 7.0]).min_col_width(110.0).show(ui, add);
 }
 
 /// Short status for the header.
@@ -300,17 +346,21 @@ fn act_button(ui: &mut Ui, a: &Act) -> egui::Response {
     }
 }
 
+/// A condition is healthy when True, except the "Pressure"-type node ones, healthy when False.
+fn condition_ok(c: &Value) -> bool {
+    let bad_when_true = s(&c["type"]).ends_with("Pressure") || s(&c["type"]) == "NetworkUnavailable";
+    (s(&c["status"]) == "True") != bad_when_true
+}
+
 fn conditions(ui: &mut Ui, v: &Value) {
     if v.as_array().is_none_or(|a| a.is_empty()) {
         return;
     }
+    let (ok, n) = (arr(v).filter(|c| condition_ok(c)).count(), arr(v).count());
+    section_with(ui, "Conditions", Some((format!("{ok} / {n} OK"), if ok == n { GREEN } else { ORANGE })));
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Conditions").weak());
         for c in arr(v) {
-            let ok = s(&c["status"]) == "True";
-            // "Pressure"-type node conditions are healthy when False.
-            let bad_when_true = s(&c["type"]).ends_with("Pressure") || s(&c["type"]) == "NetworkUnavailable";
-            let color = if ok != bad_when_true { GREEN } else if ok { RED } else { ORANGE };
+            let color = if condition_ok(c) { GREEN } else if s(&c["status"]) == "True" { RED } else { ORANGE };
             let tip = format!("{} {}", s(&c["reason"]), s(&c["message"]));
             let r = chip(ui, s(&c["type"]), Some(color));
             if !tip.trim().is_empty() {
@@ -555,39 +605,46 @@ impl Details {
         // Both directions: something wider than the panel scrolls instead of widening it (a
         // side panel wider than the window disappears).
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            match (&self.obj, &self.error) {
-                (_, Some(e)) => {
-                    ui.colored_label(RED, e);
-                }
-                (None, None) => {
-                    ui.spinner();
-                }
-                _ => {}
-            }
-            if let Some(obj) = self.obj.clone() {
-                let yaml = |ui: &mut Ui| {
-                    let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-                    let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
-                    // Wrapped: certificates and last-applied annotations are single lines thousands of pixels wide.
-                    job.wrap = egui::text::TextWrapping { max_width: ui.available_width(), ..Default::default() };
-                    find::job(ui, job);
-                };
-                match (full, self.section) {
-                    (true, Section::Events) => self.events_ui(ui),
-                    (true, Section::Yaml) => yaml(ui),
-                    (true, Section::Overview) => {
-                        self.body(ui, &obj, metrics, acts);
-                        self.related_ui(ui, acts);
+            let inset = egui::Margin { left: FRAME_OUT as i8 + 2, right: FRAME_OUT as i8 + 2, top: 0, bottom: 8 };
+            egui::Frame::new().inner_margin(inset).show(ui, |ui| {
+                OPEN.with(|o| o.set(None));
+                match (&self.obj, &self.error) {
+                    (_, Some(e)) => {
+                        ui.colored_label(RED, e);
                     }
-                    (false, _) => {
-                        self.body(ui, &obj, metrics, acts);
-                        self.related_ui(ui, acts);
-                        self.events_ui(ui);
-                        let hit = find::matches(|| ops::to_yaml(&obj));
-                        egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, yaml);
+                    (None, None) => {
+                        ui.spinner();
+                    }
+                    _ => {}
+                }
+                if let Some(obj) = self.obj.clone() {
+                    let yaml = |ui: &mut Ui| {
+                        let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
+                        let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
+                        // Wrapped: certificates and last-applied annotations are single lines thousands of pixels wide.
+                        job.wrap = egui::text::TextWrapping { max_width: ui.available_width(), ..Default::default() };
+                        find::job(ui, job);
+                    };
+                    match (full, self.section) {
+                        (true, Section::Events) => self.events_ui(ui),
+                        (true, Section::Yaml) => yaml(ui),
+                        (true, Section::Overview) => {
+                            self.body(ui, &obj, metrics, acts);
+                            self.related_ui(ui, acts);
+                        }
+                        (false, _) => {
+                            self.body(ui, &obj, metrics, acts);
+                            self.related_ui(ui, acts);
+                            self.events_ui(ui);
+                            end_sections(ui);
+                            ui.add_space(8.0);
+                            let hit = find::matches(|| ops::to_yaml(&obj));
+                            egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, yaml);
+                        }
                     }
                 }
-            }
+                end_sections(ui);
+            });
         });
         find::end(find);
     }
@@ -595,6 +652,7 @@ impl Details {
     fn body(&mut self, ui: &mut Ui, obj: &Value, m: &Metrics, acts: &mut Vec<Act>) {
         let meta = &obj["metadata"];
         let ns = s(&meta["namespace"]).to_string();
+        section(ui, "Overview");
         grid(ui, "meta", |ui| {
             let created = meta["creationTimestamp"].as_str().unwrap_or_default();
             kv(ui, "Created", format!("{} ago ({created})", watch::date_cell(created)));
@@ -823,12 +881,10 @@ impl Details {
     /// Secret / ConfigMap data: each key can be shown, copied, edited or removed on its own.
     fn data_ui(&mut self, ui: &mut Ui, obj: &Value, secret: bool) {
         let can_edit = self.t.kind.can("update");
-        ui.add_space(8.0);
+        let n = obj["data"].as_object().map_or(0, |d| d.len());
+        let kind = if secret { format!("{} · ", s(&obj["type"])) } else { String::new() };
+        section_with(ui, "Data", Some((format!("{kind}{n} key{}", if n == 1 { "" } else { "s" }), ui_kit::tokens(ui).muted)));
         ui.horizontal(|ui| {
-            find::label(ui, RichText::new("Data").strong().size(ui_kit::sz(15.0)));
-            if secret {
-                find::label(ui, RichText::new(format!("({})", s(&obj["type"]))).weak());
-            }
             if self.save.is_some() {
                 ui.spinner();
             }
@@ -838,7 +894,6 @@ impl Details {
                 None => ui.label(""),
             };
         });
-        ui.separator();
 
         let data = obj["data"].clone();
         let mut edit = None;
@@ -886,6 +941,9 @@ impl Details {
                     (Some(t), false) => find::masked(ui, t),
                 };
                 ui.add_space(4.0);
+                let y = ui.cursor().top();
+                ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, ui_kit::tokens(ui).line));
+                ui.add_space(5.0);
             });
         }
         if self.editing.as_ref().is_some_and(|e| e.orig.is_none()) {
@@ -959,7 +1017,16 @@ impl Details {
         for (init, c) in arr(&spec["initContainers"]).map(|c| (true, c)).chain(arr(&spec["containers"]).map(|c| (false, c))) {
             let name = s(&c["name"]);
             let st = statuses.iter().find(|x| s(&x["name"]) == name);
-            section(ui, &format!("{}{name}", if init { "Init: " } else { "Container: " }));
+            let summary = st.map(|st| {
+                let state = st["state"].as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
+                let color = match state.as_str() {
+                    "running" => GREEN,
+                    "waiting" => ORANGE,
+                    _ => ui_kit::tokens(ui).muted,
+                };
+                (format!("{state} · {} restarts", st["restartCount"]), ui_kit::status_fg(ui, color))
+            });
+            section_with(ui, &format!("{}{name}", if init { "Init: " } else { "Container: " }), summary);
             grid(ui, &format!("c-{name}"), |ui| {
                 if let Some(st) = st {
                     let (state, detail) = match st["state"].as_object().and_then(|o| o.iter().next()) {
@@ -1068,7 +1135,7 @@ impl Details {
                     if items.is_empty() {
                         continue;
                     }
-                    section(ui, &format!("{kind}s ({})", items.len()));
+                    section_with(ui, &format!("{kind}s"), Some((items.len().to_string(), ui_kit::tokens(ui).muted)));
                     egui::Grid::new(("related", kind)).num_columns(3).striped(true).spacing([12.0, 3.0]).show(ui, |ui| {
                         for r in items {
                             let color = cell_color("Status", &r.status).unwrap_or(ui.visuals().weak_text_color());
@@ -1090,7 +1157,9 @@ impl Details {
     fn events_ui(&self, ui: &mut Ui) {
         match &self.events {
             Some(Ok(evs)) if !evs.is_empty() => {
-                section(ui, &format!("Events ({})", evs.len()));
+                let warnings = evs.iter().filter(|e| e.kind == "Warning").count();
+                let summary = if warnings > 0 { (format!("{} · {warnings} warnings", evs.len()), ui_kit::status_fg(ui, ORANGE)) } else { (evs.len().to_string(), ui_kit::tokens(ui).muted) };
+                section_with(ui, "Events", Some(summary));
                 for e in evs.iter().take(50) {
                     ui.horizontal_wrapped(|ui| {
                         let c = if e.kind == "Warning" { ORANGE } else { GREEN };

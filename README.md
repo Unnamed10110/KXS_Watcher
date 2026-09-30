@@ -32,11 +32,14 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Object sub-tabs** inside each cluster tab (double-click a row). Details per kind link to
   everything they reference: owner, node, service account, config maps, secrets, volume claims,
   ingress backends, role bindings, HPA targets, event objects… plus related pods/ReplicaSets/Jobs.
+  Each part (overview, conditions, references, every container, events…) is its own framed block
+  with a colored header and a summary (`5 / 5 OK`, `running · 0 restarts`); key/value rows are striped.
 - **Secret / ConfigMap editor**: edit, add and remove keys, Save (conflicts are detected).
 - **Actions**: edit YAML, create from YAML (multi-document, server-side apply), delete, scale,
   rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
 - **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
-  wrap, timestamps, previous container, Ctrl+F find (plain or regex, only-matching), scrolling to the
+  wrap, timestamps and pod name (on by default), previous container, ⬆ Start / ⬇ End (Ctrl+Home /
+  Ctrl+End; scrolled up, "N new lines · Go to end" appears), find matches marked on the scroll track, Ctrl+F find (plain or regex, only-matching), scrolling to the
   top loads earlier lines, dropped connections resume on their own. **📅 Logs by date** (a dialog) shows a
   date range, From and To: `2026-09-28 14:30`, `14:30` (today), `2h` / `30m` / `1d` ago, a UTC timestamp
   copied from a line, or Last 15 min / 1 h / 6 h / 24 h / Today / Yesterday; To empty keeps following.
@@ -44,7 +47,9 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   **Save…** writes the shown lines (filter and options applied) to a `.log` file; **⬇ Download all…**
   streams every line the pod still has (the previous container's with Previous, timestamps with
   Timestamps; several pods or containers one after the other), with its size as it goes and Cancel.
-- **Ctrl+K** finds text in the current view (lists, details, YAML, logs). Collapsed sections with
+- **Ctrl+K** finds text in the current view (lists, details, YAML, logs): the current match solid amber,
+  every other one amber and underlined; the list filter's matches are marked the same way, with a
+  "N matches in M rows" count. Collapsed sections with
   matches open; hidden secret values are searched too and flagged without being revealed.
 - **Search configs & secrets**: text (plain or regex) in every Config Map and Secret value, key and
   name, in all or the selected namespaces. Secret values stay masked unless shown; a click opens the

@@ -955,7 +955,7 @@ impl Ready {
             ui.style_mut().always_scroll_the_only_direction = true;
             egui::ScrollArea::horizontal().id_salt(("pagetabs", self.kctx.id())).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.set_height(ui_kit::sz(38.0));
+                    ui.set_height(ui_kit::sz(48.0));
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let mut items = vec![];
                     for (i, pt) in pages.iter_mut().enumerate() {
@@ -1452,6 +1452,10 @@ impl Ready {
                 }
                 if let Some(e) = &l.filter_error {
                     ui.colored_label(RED, "invalid regex").on_hover_text(e);
+                } else if !l.search.trim().is_empty() {
+                    let (n, rows) = (l.filter_hits, l.view.len());
+                    let text = format!(" {n} match{} in {rows} row{} ", if n == 1 { "" } else { "es" }, if rows == 1 { "" } else { "s" });
+                    ui.label(RichText::new(text).strong().color(crate::find::HIT).background_color(crate::find::hit_bg(false).gamma_multiply(0.6)));
                 }
             }
             ui.add_space(8.0);

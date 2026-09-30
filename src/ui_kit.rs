@@ -470,17 +470,21 @@ pub fn tab(ui: &mut Ui, text: &str, current: bool, italic: bool, mono_: bool) ->
     let t = tokens(ui);
     let fg = if current { t.text } else { t.muted };
     let mut rt = RichText::new(text).color(fg).font(match (mono_, current) {
-        (true, _) => mono(12.5),
-        (false, true) => semibold(13.0),
-        (false, false) => prop(13.0),
+        (true, _) => mono(14.0),
+        (false, true) => semibold(15.0),
+        (false, false) => prop(15.0),
     });
     if italic {
         rt = rt.italics();
     }
+    let under = ui.painter().add(Shape::Noop); // the lit background goes under the label
     let r = ui.add(egui::Label::new(rt).sense(Sense::click_and_drag()).selectable(false));
     if current {
-        let y = ui.max_rect().bottom() - 1.0;
-        ui.painter().line_segment([Pos2::new(r.rect.left() - 10.0, y), Pos2::new(r.rect.right() + 26.0, y)], Stroke::new(2.0, t.accent));
+        // A lit tab: a raised background and a thick accent underline.
+        let bottom = ui.max_rect().bottom();
+        let lit = Rect::from_min_max(Pos2::new(r.rect.left() - 12.0, ui.max_rect().top() + 4.0), Pos2::new(r.rect.right() + 28.0, bottom));
+        ui.painter().set(under, egui::epaint::RectShape::filled(lit, CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, t.hover.gamma_multiply(0.7)));
+        ui.painter().line_segment([Pos2::new(lit.left(), bottom - 1.5), Pos2::new(lit.right(), bottom - 1.5)], Stroke::new(3.0, t.accent));
     }
     r
 }
@@ -573,28 +577,28 @@ pub fn pill_tab(ui: &mut Ui, icon_: Option<Icon>, text: &str, current: bool, mon
     let t = tokens(ui);
     let fg = if current { t.text } else { t.muted };
     let font = match (mono_, current) {
-        (true, _) => mono(12.0),
-        (false, true) => semibold(12.5),
-        (false, false) => prop(12.5),
+        (true, _) => mono(13.0),
+        (false, true) => semibold(14.0),
+        (false, false) => prop(14.0),
     };
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
-    let lead = if icon_.is_some() { 20.0 } else { 0.0 };
-    let trail = if closable { 20.0 } else { 0.0 };
-    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 20.0, sz(26.0)), Sense::click_and_drag());
+    let lead = if icon_.is_some() { 22.0 } else { 0.0 };
+    let trail = if closable { 22.0 } else { 0.0 };
+    let (rect, r) = ui.allocate_exact_size(vec2(galley.size().x + lead + trail + 24.0, sz(34.0)), Sense::click_and_drag());
     let (fill, stroke) = if current {
         (t.accent_soft, Stroke::new(1.0, mix(t.bg, t.accent, 0.5)))
     } else {
         (if r.hovered() { t.hover } else { Color32::TRANSPARENT }, Stroke::new(1.0, t.line))
     };
-    ui.painter().rect(rect, CornerRadius::same(6), fill, stroke, StrokeKind::Inside);
-    let mut x = rect.left() + 10.0;
+    ui.painter().rect(rect, CornerRadius::same(8), fill, stroke, StrokeKind::Inside);
+    let mut x = rect.left() + 12.0;
     if let Some(i) = icon_ {
-        paint_icon(ui, Rect::from_center_size(Pos2::new(x + 6.5, rect.center().y), Vec2::splat(13.0)), i, fg);
+        paint_icon(ui, Rect::from_center_size(Pos2::new(x + 7.5, rect.center().y), Vec2::splat(15.0)), i, fg);
         x += lead;
     }
     ui.painter().galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, fg);
     let close = closable.then(|| {
-        let xr = Rect::from_center_size(Pos2::new(rect.right() - 13.0, rect.center().y), vec2(18.0, 18.0));
+        let xr = Rect::from_center_size(Pos2::new(rect.right() - 15.0, rect.center().y), vec2(20.0, 20.0));
         let x = ui.interact(xr, r.id.with("close"), Sense::click());
         if x.hovered() {
             ui.painter().rect_filled(xr, CornerRadius::same(4), t.tag);

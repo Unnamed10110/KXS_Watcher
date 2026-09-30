@@ -476,6 +476,8 @@ pub struct LogTab {
     set_offset: Option<f32>,
     last_off: f32,
     view_h: f32,
+    /// Buffer length when the view left the bottom: the lines after it are new ("Ir al final").
+    away_from: Option<usize>,
     status: String,
 }
 
@@ -500,8 +502,8 @@ impl LogTab {
             saving: None,
             progress: None,
             note: None,
-            show_ts: false,
-            show_src: false,
+            show_ts: true,
+            show_src: true,
             wrap: false,
             follow: true,
             buf: Default::default(),
@@ -521,6 +523,7 @@ impl LogTab {
             set_offset: None,
             last_off: 0.0,
             view_h: 0.0,
+            away_from: None,
             status: "resolving pods…".into(),
         }
     }
@@ -722,7 +725,6 @@ impl LogTab {
                 Ok(pods) => {
                     if pods.len() > 1 {
                         self.title = format!("Logs ({} pods)", pods.len());
-                        self.show_src = true;
                     }
                     if self.container.is_empty() {
                         self.container = pods.first().map(|p| p.default.clone()).unwrap_or_default();
@@ -849,7 +851,7 @@ impl LogTab {
             if ui.checkbox(&mut self.follow, "Follow").changed() && self.follow {
                 self.set_offset = Some(f32::MAX);
             }
-            if ui.add_enabled(!self.exhausted && self.earlier.is_none(), egui::Button::new("⤒ Earlier")).on_hover_text("Load earlier lines (also when scrolling to the top)").clicked() {
+            if ui.add_enabled(!self.exhausted && self.earlier.is_none(), egui::Button::new("↑ Earlier")).on_hover_text("Load earlier lines (also when scrolling to the top)").clicked() {
                 self.load_earlier(ui.ctx());
             }
             if ui.button("🔍 Find").on_hover_text("Ctrl+F").clicked() {
@@ -885,6 +887,13 @@ impl LogTab {
                 }
             }
             restart |= ui.button("⟳ Reload").clicked();
+            ui.separator();
+            if ui.button("⬆ Start").on_hover_text("First line (Ctrl+Home)").clicked() {
+                self.to_start();
+            }
+            if ui.button("⬇ End").on_hover_text("Last line, and follow (Ctrl+End)").clicked() {
+                self.to_end();
+            }
             if self.earlier.is_some() || self.init.is_some() {
                 ui.spinner();
             }
@@ -908,6 +917,14 @@ impl LogTab {
         self.only_matching = only;
         ui.separator();
         self.lines_ui(ui);
+    }
+
+    fn to_start(&mut self) {
+        (self.follow, self.set_offset) = (false, Some(0.0));
+    }
+
+    fn to_end(&mut self) {
+        (self.follow, self.set_offset, self.away_from) = (true, Some(f32::MAX), None);
     }
 
     fn visible_text(&self) -> String {
@@ -1019,12 +1036,54 @@ impl LogTab {
                 ui.add(egui::Label::new(job).extend());
             }
         });
+        let lines = b.lines.len();
+        // Matches on the scroll track, the current one white (at most one per pixel row).
+        if !self.hits.is_empty() && lines > 0 {
+            let track = out.inner_rect;
+            let mut last_y = f32::NEG_INFINITY;
+            for (k, &(li, first)) in self.hits.iter().enumerate() {
+                let y = track.top() + track.height() * li as f32 / lines as f32;
+                let next = self.hits.get(k + 1).map_or(self.find.total as u32, |h| h.1);
+                let current = (first as usize..next as usize).contains(&self.find.current);
+                if y - last_y >= 1.0 || current {
+                    let color = if current { Color32::WHITE } else { find::HIT };
+                    ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(track.right() - 5.0, y - 1.0), egui::vec2(5.0, 3.0)), 1.0, color);
+                    last_y = y;
+                }
+            }
+        }
         drop(b);
         let off = out.state.offset.y;
         if off <= 0.0 && self.last_off > 0.0 {
             self.load_earlier(ui.ctx()); // reached the top: fetch older lines
         }
         (self.last_off, self.view_h) = (off, out.inner_rect.height());
+        // Away from the bottom with new lines coming in: offer to jump there.
+        let at_bottom = off + out.inner_rect.height() >= out.content_size.y - row_h;
+        if at_bottom {
+            self.away_from = None;
+        } else {
+            let from = *self.away_from.get_or_insert(lines);
+            let new = lines.saturating_sub(from);
+            if new > 0 {
+                let text = format!("⬇ {new} new line{} · Go to end", if new == 1 { "" } else { "s" });
+                let size = egui::vec2(ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), FontId::proportional(13.0), Color32::WHITE).size().x) + 36.0, 34.0);
+                let at = egui::Rect::from_min_size(out.inner_rect.right_bottom() - size - egui::vec2(24.0, 14.0), size);
+                let pill = egui::Button::new(RichText::new(text).strong()).corner_radius(17.0).stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
+                if ui.put(at, pill).clicked() {
+                    self.to_end();
+                }
+            }
+        }
+        if ui.rect_contains_pointer(out.inner_rect) {
+            let (home, end) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Home), i.consume_key(egui::Modifiers::COMMAND, egui::Key::End)));
+            if home {
+                self.to_start();
+            }
+            if end {
+                self.to_end();
+            }
+        }
     }
 }
 

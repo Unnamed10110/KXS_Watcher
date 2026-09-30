@@ -1193,7 +1193,7 @@ impl eframe::App for App {
 
         let mut out = Out { node_image: self.settings.node_shell_image.clone(), ..Default::default() };
         let accents = self.settings.accents.clone();
-        let tab_font = self.settings.text_size * ui_kit::factor(ui_kit::Area::Tabs);
+        let tab_font = (self.settings.text_size + 1.5) * ui_kit::factor(ui_kit::Area::Tabs);
         let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_keys: false, hovered: None, tab_font, accents: &accents };
         let mut dock_hovered = false;
         if self.dock.iter_all_tabs().next().is_some() {
@@ -1201,7 +1201,9 @@ impl eframe::App for App {
             dock_hovered = egui::Panel::bottom("dock").resizable(true).default_size(280.0).size_range(120.0..=max).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
                 let mut style = Style::from_egui(ui.style());
                 style.tab_bar.bg_fill = t.chrome;
-                style.tab_bar.height = (24.0 * ui_kit::factor(ui_kit::Area::Tabs)).max(20.0);
+                style.tab_bar.height = (40.0 * ui_kit::factor(ui_kit::Area::Tabs)).max(28.0);
+                style.tab.hline_below_active_tab_name = true;
+                style.tab.minimum_width = Some(120.0);
                 style.tab_bar.hline_color = t.line;
                 style.tab.tab_body.bg_fill = t.chrome;
                 style.tab.tab_body.stroke = Stroke::NONE;
