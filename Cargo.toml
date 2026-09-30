@@ -9,7 +9,8 @@ egui = "0.35.0"
 # glow (OpenGL) instead of the default wgpu: ~55 MB vs ~280 MB private memory at idle on Windows.
 # ponytail: needs OpenGL 3+; switch back to "wgpu" for GPU-less RDP/VM hosts if that matters.
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
-egui_extras = { version = "0.35.0", default-features = false, features = ["syntect"] }
+# serde: tables keep their column widths across restarts.
+egui_extras = { version = "0.35.0", default-features = false, features = ["syntect", "serde"] }
 # eframe's own winit, for its Windows message hook (Alt codes, see `alt_codes` in main.rs).
 winit = { version = "0.30", default-features = false }
 egui_dock = "0.20.1"

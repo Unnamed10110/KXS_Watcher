@@ -434,9 +434,28 @@ const SRC_COLORS: [Color32; 8] = [
     Color32::from_rgb(156, 220, 254), Color32::from_rgb(214, 157, 133), Color32::from_rgb(181, 206, 168), Color32::from_rgb(255, 128, 128),
 ];
 
+/// A log tab as saved at exit: what it shows and how.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LogState {
+    /// (group, kind, namespace, name) of each object whose pods are shown.
+    pub targets: Vec<(String, String, String, String)>,
+    pub container: String,
+    pub all_containers: bool,
+    pub previous: bool,
+    pub show_ts: bool,
+    pub show_src: bool,
+    pub wrap: bool,
+    pub follow: bool,
+    /// Date range: (from, to) as typed.
+    pub range: (String, String),
+}
+
 pub struct LogTab {
     pub title: String,
     client: Client,
+    /// What the tab was opened for, for `state`.
+    targets: Vec<(String, String, String, String)>,
     init: Option<Pending<Res<Vec<PodInfo>>>>,
     pods: Vec<PodInfo>,
     /// Chosen container for a single pod.
@@ -488,8 +507,10 @@ impl LogTab {
             [(_, _, name)] => format!("Logs {name}"),
             t => format!("Logs ({} objects)", t.len()),
         };
+        let saved = targets.iter().map(|(k, ns, n)| (k.ar.group.clone(), k.ar.kind.clone(), ns.clone(), n.clone())).collect();
         LogTab {
             title,
+            targets: saved,
             init: Some(Pending::spawn(ctx, pod_infos(client.clone(), targets))),
             client,
             pods: vec![],
@@ -919,6 +940,26 @@ impl LogTab {
         self.lines_ui(ui);
     }
 
+    pub fn state(&self) -> LogState {
+        LogState {
+            targets: self.targets.clone(),
+            container: self.container.clone(),
+            all_containers: self.all_containers,
+            previous: self.previous,
+            show_ts: self.show_ts,
+            show_src: self.show_src,
+            wrap: self.wrap,
+            follow: self.follow,
+            range: self.range.clone(),
+        }
+    }
+
+    /// Options of a saved tab (before its streams start; the container goes to `new`).
+    pub fn restore(&mut self, s: &LogState) {
+        (self.all_containers, self.previous, self.show_ts, self.show_src, self.wrap, self.follow) = (s.all_containers, s.previous, s.show_ts, s.show_src, s.wrap, s.follow);
+        self.range = s.range.clone();
+    }
+
     fn to_start(&mut self) {
         (self.follow, self.set_offset) = (false, Some(0.0));
     }
@@ -1094,6 +1135,8 @@ pub static TERM_TX: OnceLock<Sender<(u64, PtyEvent)>> = OnceLock::new();
 
 pub struct TermTab {
     pub title: String,
+    /// A local terminal for this context (id): reopened on the next start.
+    pub local: Option<String>,
     backend: TerminalBackend,
     /// Pod this terminal owns (node shell): deleted when the terminal goes away.
     pub cleanup: Option<Cleanup>,
@@ -1116,7 +1159,7 @@ impl TermTab {
     pub fn new(ctx: &egui::Context, id: u64, title: String, (shell, args): Command) -> std::io::Result<Self> {
         let tx = TERM_TX.get().expect("terminal channel").clone();
         let settings = BackendSettings { shell, args, working_directory: kubeconfig::home() };
-        Ok(TermTab { title, backend: TerminalBackend::new(id, ctx.clone(), tx, settings)?, cleanup: None, drawn: 0 })
+        Ok(TermTab { title, local: None, backend: TerminalBackend::new(id, ctx.clone(), tx, settings)?, cleanup: None, drawn: 0 })
     }
 
     /// Whether typing goes here (the app leaves its shortcuts to the terminal then).

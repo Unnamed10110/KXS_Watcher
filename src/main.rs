@@ -72,6 +72,14 @@ impl Out {
         self.tabs.push(Tab { id: next_id(), body, cluster: None });
     }
 
+    /// A local terminal pinned to a context; reopened on the next start.
+    pub fn local_term(&mut self, ctx: &egui::Context, k: &Ctx) {
+        self.term(ctx, format!("Terminal {}", k.name), tabs::local_shell(k), None);
+        if let Some(Tab { body: Body::Term(t), .. }) = self.tabs.last_mut() {
+            t.local = Some(k.id());
+        }
+    }
+
     /// Terminal tab; `cleanup` names a pod to delete when it closes (node shells).
     pub fn term(&mut self, ctx: &egui::Context, title: String, cmd: tabs::Command, cleanup: Option<tabs::Cleanup>) {
         let id = next_id();
@@ -88,6 +96,14 @@ impl Out {
             }
         }
     }
+}
+
+/// A dock tab kept across restarts: logs (reopened once their cluster connects) and local
+/// terminals. Pod and node shells and editors are not: a node shell starts a privileged pod.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+enum Docked {
+    Logs { cluster: String, state: tabs::LogState },
+    Terminal { context: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +132,8 @@ struct Settings {
     current: Option<String>,
     /// Font size of the tabs, sidebar, lists, details, logs, editor and terminal.
     sizes: ui_kit::Sizes,
+    /// Dock tabs open at exit, in order.
+    docked: Vec<Docked>,
 }
 
 /// Cluster colors, readable on dark and light themes. Rose is last, so red stays a deliberate pick (prod).
@@ -164,6 +182,7 @@ impl Default for Settings {
             aliases: HashMap::new(),
             current: None,
             sizes: ui_kit::Sizes::default(),
+            docked: vec![],
         }
     }
 }
@@ -205,6 +224,8 @@ struct App {
     fonts: (String, String),
     /// The last window placement eframe saved while the window was on screen.
     good_window: Option<String>,
+    /// Saved log tabs waiting for their cluster to connect.
+    pending_docks: Vec<Docked>,
     /// Kubeconfig files and their modification times, checked every few seconds.
     kube_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     kube_checked: Instant,
@@ -309,7 +330,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, term_rx: Receiver<(u64, PtyEvent)>) -> Self {
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let fonts = theme::install_fonts(&cc.egui_ctx, &settings.mono_font);
-        alt_codes::CTX.set(cc.egui_ctx.clone()).ok();
+        keys::CTX.set(cc.egui_ctx.clone()).ok();
         settings.apply_look(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(settings.zoom);
         let window = cc.storage.and_then(|s| s.get_string("window"));
@@ -321,6 +342,7 @@ impl App {
             contexts: kubeconfig::discover(&settings.paths),
             kube_stamp: kubeconfig::stamp(&settings.paths),
             kube_checked: Instant::now(),
+            pending_docks: vec![],
             paths_text: settings.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
             settings,
             clusters: vec![],
@@ -345,7 +367,43 @@ impl App {
             }
         }
         app.cur = app.clusters.iter().position(|t| t.cluster.is_some() && t.cluster == app.settings.current).unwrap_or(0);
+        // Dock tabs of the last session: terminals now, logs once their cluster is connected.
+        let mut out = Out::default();
+        for d in std::mem::take(&mut app.settings.docked) {
+            match &d {
+                Docked::Terminal { context } => {
+                    if let Some(c) = app.contexts.iter().find(|c| c.id() == *context) {
+                        out.local_term(&cc.egui_ctx, c);
+                        let open = app.open_ids().contains(context);
+                        out.tabs.last_mut().filter(|_| open).into_iter().for_each(|t| t.cluster = Some(context.clone()));
+                    }
+                }
+                Docked::Logs { .. } => app.pending_docks.push(d),
+            }
+        }
+        app.absorb(out);
         app
+    }
+
+    /// Reopens saved log tabs whose cluster has connected; drops those of clusters that are closed
+    /// or couldn't connect.
+    fn restore_docks(&mut self, ctx: &egui::Context) {
+        let mut opened = vec![];
+        for d in std::mem::take(&mut self.pending_docks) {
+            let Docked::Logs { cluster, state } = &d else { continue };
+            match self.clusters.iter().filter_map(Self::cluster_of).find(|c| c.kctx.id() == *cluster) {
+                Some(c) if c.is_ready() => {
+                    if let Some(t) = c.restore_logs(ctx, state) {
+                        opened.push(Tab { id: next_id(), body: Body::Logs(Box::new(t)), cluster: Some(cluster.clone()) });
+                    }
+                }
+                Some(c) if !c.failed() => self.pending_docks.push(d), // still connecting
+                _ => {}
+            }
+        }
+        for t in opened {
+            self.place(t);
+        }
     }
 
     /// Native dialog for kubeconfig files (several at once) or a folder; runs off the UI thread.
@@ -576,7 +634,7 @@ impl App {
         }
         if let Some(c) = terminal {
             let mut out = Out::default();
-            out.term(&ctx, format!("Terminal {}", c.name), tabs::local_shell(&c), None);
+            out.local_term(&ctx, &c);
             self.settings.accent(&c.id());
             out.tabs.iter_mut().for_each(|t| t.cluster = Some(c.id()));
             self.absorb(out);
@@ -1077,10 +1135,14 @@ fn swatch(ui: &mut Ui, color: Color32, on: bool) -> egui::Response {
     r
 }
 
-/// Windows Alt codes (Alt + 1 2 4 on the numpad types `|`): Windows sends the character after Alt
-/// is released, when winit has no key event left to attach it to, so winit drops it. A message
-/// hook catches it and `raw_input_hook` hands it to egui as typed text.
-mod alt_codes {
+/// Two Windows keyboard quirks, fixed in a message hook that sees every message before winit:
+/// - Alt codes (Alt + 1 2 4 on the numpad types `|`): Windows sends the character after Alt is
+///   released, when winit has no key event left to attach it to, so winit drops it. The hook
+///   catches it and `raw_input_hook` hands it to egui as typed text.
+/// - When no window of ours has the keyboard focus (after a native dialog, for one), Windows sends
+///   plain keys as "system" keys, and their default handling beeps on every key even though the
+///   text still gets typed. The hook takes the focus back and passes them on as ordinary keys.
+mod keys {
     use std::cell::Cell;
     use std::ffi::c_void;
     use std::sync::{Mutex, OnceLock};
@@ -1099,19 +1161,38 @@ mod alt_codes {
         hwnd: *mut c_void,
         message: u32,
         wparam: usize,
+        lparam: isize,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetFocus(hwnd: *mut c_void) -> *mut c_void;
     }
 
     const WM_KEYFIRST: u32 = 0x0100;
+    const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     const WM_CHAR: u32 = 0x0102;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
     const WM_SYSKEYUP: u32 = 0x0105;
     const WM_KEYLAST: u32 = 0x0109;
     const VK_MENU: usize = 0x12;
+    const VK_F10: usize = 0x79;
+    /// lParam bit 29: Alt was down.
+    const ALT_DOWN: isize = 1 << 29;
 
-    /// Sees every message before winit; never swallows one.
+    /// Sees every message before winit; never swallows one, may turn a key into a plain one.
     pub fn hook(msg: *const c_void) -> bool {
-        // SAFETY: winit passes a valid `*const MSG` for each message it takes from the queue.
-        let m = unsafe { &*(msg as *const Msg) };
+        // SAFETY: winit passes a pointer to its own `MSG`, taken from the queue and translated and
+        // dispatched after this returns; it is writable (winit makes it from `&mut msg`).
+        let m = unsafe { &mut *(msg as *mut Msg) };
+        if matches!(m.message, WM_SYSKEYDOWN | WM_SYSKEYUP) && m.lparam & ALT_DOWN == 0 && m.wparam != VK_F10 {
+            // A "system" key without Alt: nothing of ours has the keyboard focus. Take it back so
+            // the next keys come normally, and pass this one on as a plain key (no beep).
+            // SAFETY: `hwnd` is our window, on this thread.
+            unsafe { SetFocus(m.hwnd) };
+            m.message = if m.message == WM_SYSKEYDOWN { WM_KEYDOWN } else { WM_KEYUP };
+        }
         match m.message {
             WM_KEYUP | WM_SYSKEYUP => ALT_UP.with(|a| a.set(m.wparam == VK_MENU)),
             WM_CHAR if ALT_UP.with(|a| a.replace(false)) => {
@@ -1127,11 +1208,36 @@ mod alt_codes {
         }
         false
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn msg(message: u32, wparam: usize, lparam: isize) -> Msg {
+            Msg { hwnd: std::ptr::null_mut(), message, wparam, lparam }
+        }
+
+        #[test]
+        fn system_keys_without_alt_become_plain_keys() {
+            let mut m = msg(WM_SYSKEYDOWN, 0x5A, 1); // Z with no focus window: would beep
+            hook(&mut m as *mut Msg as *const c_void);
+            assert_eq!(m.message, WM_KEYDOWN);
+            let mut m = msg(WM_SYSKEYUP, 0x5A, 1 | (3 << 30));
+            hook(&mut m as *mut Msg as *const c_void);
+            assert_eq!(m.message, WM_KEYUP);
+            let mut m = msg(WM_SYSKEYDOWN, 0x61, 1 | ALT_DOWN); // Alt + numpad 1 (an Alt code): untouched
+            hook(&mut m as *mut Msg as *const c_void);
+            assert_eq!(m.message, WM_SYSKEYDOWN);
+            let mut m = msg(WM_SYSKEYDOWN, VK_F10, 1); // F10 is a real system key
+            hook(&mut m as *mut Msg as *const c_void);
+            assert_eq!(m.message, WM_SYSKEYDOWN);
+        }
+    }
 }
 
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        let typed = std::mem::take(&mut *alt_codes::TYPED.lock().unwrap());
+        let typed = std::mem::take(&mut *keys::TYPED.lock().unwrap());
         if !typed.is_empty() {
             raw_input.events.push(egui::Event::Text(typed));
         }
@@ -1177,6 +1283,9 @@ impl eframe::App for App {
             }
         }
         self.watch_kubeconfigs(&ctx);
+        if !self.pending_docks.is_empty() {
+            self.restore_docks(&ctx);
+        }
         if let Some(picked) = take(&mut self.picking).filter(|p| !p.is_empty()) {
             self.add_sources(picked);
         }
@@ -1278,6 +1387,17 @@ impl eframe::App for App {
         // Open clusters, in tab order, come back on the next start.
         self.settings.open = self.clusters.iter().filter_map(Self::cluster_of).map(|c| c.kctx.id()).collect();
         self.settings.current = self.clusters.get(self.cur).and_then(|t| t.cluster.clone());
+        let mut docked: Vec<Docked> = self
+            .dock
+            .iter_all_tabs()
+            .filter_map(|(_, t)| match &t.body {
+                Body::Logs(l) => t.cluster.clone().map(|cluster| Docked::Logs { cluster, state: l.state() }),
+                Body::Term(x) => x.local.clone().map(|context| Docked::Terminal { context }),
+                _ => None,
+            })
+            .collect();
+        docked.extend(self.pending_docks.iter().cloned()); // not reopened yet: keep them
+        self.settings.docked = docked;
         // Closed clusters keep their last tabs, so reopening one restores them too.
         for c in self.clusters.iter().filter_map(App::cluster_of) {
             if let Some(s) = c.saved() {
@@ -1303,7 +1423,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([900.0, 560.0]),
         event_loop_builder: Some(Box::new(|b| {
             use winit::platform::windows::EventLoopBuilderExtWindows;
-            b.with_msg_hook(alt_codes::hook);
+            b.with_msg_hook(keys::hook);
         })),
         ..Default::default()
     };

@@ -197,6 +197,28 @@ impl ClusterTab {
         }
     }
 
+    /// Connected: a saved log tab can be reopened (`restore_logs`).
+    pub fn is_ready(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    /// Couldn't connect: saved log tabs of this cluster are dropped.
+    pub fn failed(&self) -> bool {
+        self.error.is_some()
+    }
+
+    /// A log tab saved at exit, reopened; `None` when its kinds are gone from the cluster.
+    pub fn restore_logs(&self, ctx: &egui::Context, s: &tabs::LogState) -> Option<LogTab> {
+        let r = self.ready.as_ref()?;
+        let targets: Vec<(Kind, String, String)> = s.targets.iter().filter_map(|(g, k, ns, name)| Some((r.kind(g, k)?, ns.clone(), name.clone()))).collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let mut t = LogTab::new(ctx, r.client.clone(), targets, (!s.container.is_empty()).then(|| s.container.clone()));
+        t.restore(s);
+        Some(t)
+    }
+
     /// Ctrl+W: close the object tab shown, else the page tab.
     pub fn close_tab(&mut self) {
         if let Some(r) = &mut self.ready {
@@ -918,7 +940,7 @@ impl Ready {
         let max = (ui.available_width() - 360.0).max(320.0);
         let t = ui_kit::tokens(ui);
         let frame = egui::Frame::new().fill(t.panel).inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 8 }).stroke(egui::Stroke::new(1.0, t.line));
-        let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id(), pt.id))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Details, |ui| {
+        let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id()))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Details, |ui| {
             ui.horizontal(|ui| {
                 ui_kit::section_label(ui, &p.details.t.kind.ar.kind);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1164,7 +1186,7 @@ impl Ready {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui_kit::icon_button(ui, Icon::Terminal, 30.0, "Open a terminal for this context").clicked() {
-                    out.term(ui.ctx(), format!("Terminal {}", self.kctx.name), tabs::local_shell(&self.kctx), None);
+                    out.local_term(ui.ctx(), &self.kctx);
                 }
             });
         });

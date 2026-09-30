@@ -66,7 +66,12 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   page tabs, Ctrl+1…8 go to that cluster and Ctrl+9 to the last one.
 - **Remembers the UI**: window, theme and sizes, open clusters in order and the one shown, their names and
   colors, page and object tabs (names, order, Overview/Events/YAML), namespace filter, Wide, each list's
-  filter/regex/sort/status and its open details row, the Search query, panel and column widths.
+  filter/regex/sort/status and its open details row, the Search query, the sidebar, details panel
+  and dock sizes, table column widths, and the dock's log tabs (with their options and date range,
+  reopened once the cluster connects) and local terminals. Pod and node shells and YAML editors are
+  not reopened (a node shell starts a privileged pod).
+- **No Windows "ding" while typing**: keys that reach the window while nothing has the keyboard
+  focus (after a native dialog, for one) used to beep; the window takes the focus back.
 - **Image column** on pods and every workload (deployments, stateful/daemon/replica sets, jobs, cron jobs):
   `name:version` of each container image, the full registry reference on hover.
 - **Older clusters** (k3s v1.23 and other Kubernetes before 1.26) are discovered group by group.
