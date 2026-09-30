@@ -1071,7 +1071,8 @@ impl LogTab {
         let (text_color, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
         let mut sa = egui::ScrollArea::new([!self.wrap, true]).id_salt(("logs", &self.title, self.epoch)).auto_shrink(false).stick_to_bottom(self.follow);
         if let Some(y) = self.set_offset.take() {
-            sa = sa.vertical_scroll_offset(y);
+            // Past the end show_rows draws no rows and the offset turns infinite: a black log for good.
+            sa = sa.vertical_scroll_offset(y.min((total as f32 * row_sp - self.view_h).max(0.0)));
         }
         let max_w = (b.max_chars as usize + 60) as f32 * gw;
         let out = sa.show_rows(ui, row_h, total, |ui, range| {
