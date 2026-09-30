@@ -213,16 +213,27 @@ struct LogBuf {
     max_chars: u32,
     ended: usize,
     errors: Vec<String>,
+    /// Lines that came in after a stream's first batch (its last lines or range): "N new lines".
+    appended: usize,
 }
 
 impl LogBuf {
-    fn insert(&mut self, l: Line) {
+    /// `fresh`: a line that just happened (not the first batch of a stream, not an earlier one).
+    fn insert(&mut self, l: Line, fresh: bool) {
         self.max_chars = self.max_chars.max(l.chars);
         // Sorted by time so several pods interleave; lines without a timestamp stay where they arrive.
         let pos = match l.ts {
             Some(t) if self.lines.back().is_some_and(|b| b.ts.is_some_and(|bt| bt > t)) => self.lines.partition_point(|x| x.ts.is_none_or(|xt| xt <= t)),
             _ => self.lines.len(),
         };
+        // A line already here (same nanosecond timestamp, source and text) comes once: a reload or
+        // an earlier-lines fetch racing the stream must not show it twice.
+        if l.ts.is_some() && self.lines.range(..pos).rev().take_while(|x| x.ts == l.ts).any(|x| x.same(&l)) {
+            return;
+        }
+        if fresh {
+            self.appended += 1;
+        }
         self.lines.insert(pos, l);
         if self.lines.len() > MAX_LINES {
             self.lines.pop_front();
@@ -298,6 +309,10 @@ async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Opt
         // ponytail: a not-yet-seen line with exactly the last timestamp would be skipped on resume.
         let since = last.and_then(|t| t.checked_sub(jiff::SignedDuration::from_secs(1)).ok()).or(from);
         let tail = if last.is_none() && from.is_none() && to.is_none() { Some(TAIL) } else { None };
+        // What the first request brings from before it was made isn't new, what it follows is (the
+        // node's clock may be off a little: 2 s of slack). A resumed request only brings new lines.
+        // ponytail: a node clock off by more than that counts some old lines as new, or the reverse.
+        let (resumed, asked) = (last.is_some(), jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2));
         let lp = LogParams { container: Some(src.container.clone()), follow: !fixed, previous, timestamps: true, tail_lines: tail, since_time: since, ..Default::default() };
         let mut got = 0;
         let r: anyhow::Result<()> = async {
@@ -314,7 +329,8 @@ async fn stream(client: Client, src: Source, idx: u16, previous: bool, from: Opt
                 }
                 last = line.ts.or(last);
                 got += 1;
-                buf.lock().unwrap().insert(line);
+                let fresh = resumed || line.ts.is_some_and(|t| t >= asked);
+                buf.lock().unwrap().insert(line, fresh);
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             Ok(())
@@ -566,6 +582,8 @@ impl LogTab {
         self.epoch += 1;
         self.exhausted = false;
         self.earlier = None;
+        // A fresh view starts at the top: that is not "scrolled to the top" (which loads earlier lines).
+        (self.last_off, self.anchor, self.away_from) = (0.0, None, None);
         let (from, to) = self.bounds();
         self.exhausted = to.is_some(); // a closed range: "Earlier" would fetch from the end of the log
         self._streams = self
@@ -724,6 +742,9 @@ impl LogTab {
             return;
         }
         let b = self.buf.lock().unwrap();
+        if b.lines.is_empty() {
+            return; // the streams haven't delivered their last lines yet: nothing to go back from
+        }
         if b.lines.len() as i64 + MORE > MAX_LINES as i64 {
             self.exhausted = true;
             return;
@@ -771,7 +792,7 @@ impl LogTab {
                     self.exhausted = per_src.iter().all(|(_, ex)| *ex);
                     for (lines, _) in per_src {
                         for l in lines {
-                            b.insert(l);
+                            b.insert(l, false);
                         }
                     }
                     self.epoch += 1;
@@ -1077,7 +1098,7 @@ impl LogTab {
                 ui.add(egui::Label::new(job).extend());
             }
         });
-        let lines = b.lines.len();
+        let (lines, appended) = (b.lines.len(), b.appended);
         // Matches on the scroll track, the current one white (at most one per pixel row).
         if !self.hits.is_empty() && lines > 0 {
             let track = out.inner_rect;
@@ -1104,8 +1125,8 @@ impl LogTab {
         if at_bottom {
             self.away_from = None;
         } else {
-            let from = *self.away_from.get_or_insert(lines);
-            let new = lines.saturating_sub(from);
+            let from = *self.away_from.get_or_insert(appended);
+            let new = appended.saturating_sub(from);
             if new > 0 {
                 let text = format!("⬇ {new} new line{} · Go to end", if new == 1 { "" } else { "s" });
                 let size = egui::vec2(ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), FontId::proportional(13.0), Color32::WHITE).size().x) + 36.0, 34.0);
@@ -1380,6 +1401,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_line_is_kept_once() {
+        let line = |ns: u32, text: &str| Line { ts: Some(jiff::Timestamp::new(1_790_000_000, ns as i32).unwrap()), src: 0, text: text.into(), spans: vec![], chars: text.len() as u32 };
+        let mut b = LogBuf::default();
+        for (ns, t) in [(1, "a"), (2, "b"), (3, "c")] {
+            b.insert(line(ns, t), true);
+        }
+        // The same lines again (a reload racing the stream, an earlier-lines fetch): no copies.
+        for (ns, t) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            b.insert(line(ns, t), true);
+        }
+        assert_eq!(b.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a", "b", "c", "d"]);
+        b.insert(line(4, "d2"), true); // same instant, other text: a real line
+        assert_eq!(b.lines.len(), 5);
+        assert_eq!(b.appended, 5);
+        b.insert(line(0, "earlier"), false); // loaded earlier: goes in front, isn't "new"
+        assert_eq!((b.lines[0].text.as_str(), b.appended), ("earlier", 5));
+    }
+
+    #[test]
     fn log_start_points() {
         let now: jiff::Zoned = "2026-09-28T15:00:00-03:00[-03:00]".parse().unwrap();
         let at = |s: &str| parse_since(s, &now).unwrap().map(|t| t.to_string());
@@ -1429,7 +1469,7 @@ mod tests {
     fn buffer_interleaves_sources_by_time() {
         let mut b = LogBuf::default();
         for (t, s) in [("2", 0), ("1", 1), ("3", 1), ("2", 1)] {
-            b.insert(parse_line(&format!("2026-01-01T00:00:0{t}Z x"), s));
+            b.insert(parse_line(&format!("2026-01-01T00:00:0{t}Z x"), s), true);
         }
         let order: Vec<_> = b.lines.iter().map(|l| (l.ts.unwrap().as_second() % 10, l.src)).collect();
         assert_eq!(order, vec![(1, 1), (2, 0), (2, 1), (3, 1)]);
