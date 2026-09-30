@@ -206,6 +206,57 @@ fn slice_job(job: &LayoutJob, a: usize, b: usize) -> LayoutJob {
     out
 }
 
+/// Selected log text: `anchor` (the word or line a double/triple press picked, else a point) on the
+/// buffer line `LogBuf::marks[0]`, the moving end `head` on `marks[1]`. Chars of the shown text
+/// (timestamp and pod name included), so a copy is what is on screen.
+#[derive(Clone, Copy, Debug)]
+struct Sel {
+    anchor: (usize, usize),
+    head: usize,
+    /// What a drag extends by: 1 chars, 2 words, 3 lines.
+    unit: u32,
+}
+
+impl Sel {
+    /// Start and end as (line, char), in order.
+    fn range(&self, [a, h]: [usize; 2]) -> ((usize, usize), (usize, usize)) {
+        let head = (h, self.head);
+        if head >= (a, self.anchor.0) { ((a, self.anchor.0), head.max((a, self.anchor.1))) } else { (head, (a, self.anchor.1)) }
+    }
+}
+
+/// The token around char `i` (a double click): letters, digits and `._-:/=@%+~`, as in names, IPs,
+/// images and paths, without a `.` or `:` at its end; else the one char there.
+fn word_at(text: &str, i: usize) -> (usize, usize) {
+    let c: Vec<char> = text.chars().collect();
+    let on = |k: usize| c.get(k).is_some_and(|&ch| ch.is_alphanumeric() || "._-:/=@%+~".contains(ch));
+    let at = match i {
+        _ if on(i) => i,
+        _ if i > 0 && on(i - 1) => i - 1,
+        _ => return (i.min(c.len()), (i + 1).min(c.len())),
+    };
+    let (mut a, mut b) = (at, at + 1);
+    while a > 0 && on(a - 1) {
+        a -= 1;
+    }
+    while on(b) {
+        b += 1;
+    }
+    while b > at + 1 && ".:".contains(c[b - 1]) {
+        b -= 1;
+    }
+    (a, b)
+}
+
+/// A log row on screen this frame: its line, chars `c0..c1` of it, where, and how it was laid out.
+struct Drawn {
+    li: usize,
+    c0: usize,
+    c1: usize,
+    rect: egui::Rect,
+    galley: Arc<egui::Galley>,
+}
+
 #[derive(Default)]
 struct LogBuf {
     lines: VecDeque<Line>,
@@ -215,6 +266,8 @@ struct LogBuf {
     errors: Vec<String>,
     /// Lines that came in after a stream's first batch (its last lines or range): "N new lines".
     appended: usize,
+    /// The lines of the selection's ends (`Sel`), kept on their lines as lines come in or go.
+    marks: [usize; 2],
 }
 
 impl LogBuf {
@@ -235,8 +288,10 @@ impl LogBuf {
             self.appended += 1;
         }
         self.lines.insert(pos, l);
+        self.marks.iter_mut().filter(|m| **m >= pos).for_each(|m| *m += 1);
         if self.lines.len() > MAX_LINES {
             self.lines.pop_front();
+            self.marks.iter_mut().for_each(|m| *m = m.saturating_sub(1));
         }
         self.rev += 1;
     }
@@ -509,8 +564,13 @@ pub struct LogTab {
     rows: Vec<u32>,
     rows_key: (u64, u64, usize, bool, bool, usize),
     set_offset: Option<f32>,
-    /// Text is being selected: the view holds still (new lines scrolling in would drop the selection).
+    sel: Option<Sel>,
+    /// A selection was made: a followed log holds still (until End) so it doesn't scroll away.
     hold: bool,
+    /// The last press was on this log: the keys go here even with the pointer elsewhere.
+    focused: bool,
+    /// Scrolling asked for last frame (a selection dragged past an edge), applied in the next.
+    scroll_by: egui::Vec2,
     last_off: f32,
     view_h: f32,
     /// Buffer length when the view left the bottom: the lines after it are new ("Ir al final").
@@ -560,7 +620,10 @@ impl LogTab {
             rows: vec![],
             rows_key: Default::default(),
             set_offset: None,
+            sel: None,
             hold: false,
+            focused: false,
+            scroll_by: egui::Vec2::ZERO,
             last_off: 0.0,
             view_h: 0.0,
             away_from: None,
@@ -586,7 +649,7 @@ impl LogTab {
         self.exhausted = false;
         self.earlier = None;
         // A fresh view starts at the top: that is not "scrolled to the top" (which loads earlier lines).
-        (self.last_off, self.anchor, self.away_from) = (0.0, None, None);
+        (self.last_off, self.anchor, self.away_from, self.sel, self.hold) = (0.0, None, None, None, false);
         let (from, to) = self.bounds();
         self.exhausted = to.is_some(); // a closed range: "Earlier" would fetch from the end of the log
         self._streams = self
@@ -998,12 +1061,32 @@ impl LogTab {
             Some(v) => Box::new(v.iter().map(|&i| i as usize)),
             None => Box::new(0..b.lines.len()),
         };
-        idx.filter_map(|i| b.lines.get(i)).map(|l| self.line_job(l, &FontId::monospace(12.0), Color32::WHITE, Color32::GRAY, &[], None).text).collect::<Vec<_>>().join("\n")
+        idx.filter_map(|i| b.lines.get(i)).map(|l| self.shown(l)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// A line as shown (timestamp and pod name as they are on).
+    fn shown(&self, l: &Line) -> String {
+        self.line_job(l, &FontId::monospace(12.0), Color32::WHITE, Color32::GRAY, &[], None).text
+    }
+
+    /// The selected text, lines as shown (only the matching ones with Only matching).
+    fn selected_text(&self, b: &LogBuf) -> String {
+        let Some(((l0, c0), (l1, c1))) = self.sel.map(|s| s.range(b.marks)) else { return String::new() };
+        let shown = |li: usize| self.view.as_ref().is_none_or(|v| v.binary_search(&(li as u32)).is_ok());
+        (l0..=l1.min(b.lines.len().saturating_sub(1)))
+            .filter(|&li| shown(li))
+            .map(|li| {
+                let t = self.shown(&b.lines[li]);
+                let (a, e) = (if li == l0 { c0 } else { 0 }, if li == l1 { c1 } else { usize::MAX });
+                t.chars().skip(a).take(e.saturating_sub(a)).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn lines_ui(&mut self, ui: &mut egui::Ui) {
         let buf = self.buf.clone();
-        let b = buf.lock().unwrap();
+        let mut b = buf.lock().unwrap();
         let matcher = self.find.matcher();
 
         // Match scan: on changes, throttled while lines stream in (regex over 100k lines isn't free).
@@ -1072,38 +1155,148 @@ impl LogTab {
         }
 
         let (text_color, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
-        // A drag or a double/triple press (word, line) on the log starts a selection: hold the view.
         let area = ui.available_rect_before_wrap();
-        ui.input(|i| {
-            let inside = i.pointer.press_origin().is_some_and(|o| area.contains(o));
-            if i.pointer.any_pressed() {
-                self.hold = inside && i.pointer.press_count() >= 2;
+        // Keys go to the log under the pointer, else to the one clicked last; not from a text field or
+        // a terminal on screen that has them.
+        let term = TERM_KEYS.with(|t| t.get()).is_some_and(|p| p + 1 >= ui.ctx().cumulative_pass_nr());
+        let keys = (ui.rect_contains_pointer(area) || self.focused) && !ui.ctx().text_edit_focused() && !term;
+        let (mut sel, mut marks) = (self.sel, b.marks);
+        let has_sel = sel.is_some_and(|s| s.range(marks).0 != s.range(marks).1);
+        // Positions are (buffer line, char of the shown text); rows are several per line with Wrap.
+        let len = |li: usize| {
+            b.lines.get(li).map_or(0, |l| {
+                (if self.show_ts { TS_WIDTH } else { 0 }) + if self.show_src { self.sources.get(l.src as usize).map_or(1, |s| s.tag.chars().count()) + 3 } else { 0 } + l.chars as usize
+            })
+        };
+        let vi_of = |li: usize| self.view.as_ref().map_or(li, |v| v.partition_point(|&x| (x as usize) < li)).min(n.saturating_sub(1));
+        let rows_of = |vi: usize| if self.wrap { first_row(vi)..first_row(vi + 1).max(first_row(vi) + 1) } else { vi..vi + 1 };
+        let row_of = |(li, ch): (usize, usize)| {
+            let rs = rows_of(vi_of(li));
+            (rs.start + ch / cols).min(rs.end - 1)
+        };
+        let at_row = |r: usize, col: usize| {
+            let vi = if self.wrap { self.rows.partition_point(|&p| p as usize <= r).saturating_sub(1) } else { r }.min(n - 1);
+            let li = line_at(vi);
+            (li, (r.saturating_sub(rows_of(vi).start) * if self.wrap { cols } else { 0 } + col).min(len(li)))
+        };
+
+        // Shift with the arrows, Page Up/Down and Home/End (Ctrl: of the whole log) selects, as in an
+        // editor; Ctrl+A all, Ctrl+C copies, Escape drops it.
+        if keys && n > 0 {
+            use egui::{Key, Modifiers as M};
+            #[derive(Clone, Copy)]
+            enum Mv {
+                Rows(isize),
+                Char(isize),
+                Line(bool),
+                Log(bool),
             }
-            self.hold |= inside && i.pointer.is_decidedly_dragging();
-        });
+            let page = ((self.view_h / row_sp) as isize - 1).max(1);
+            let table = [
+                (M::COMMAND | M::SHIFT, Key::Home, Mv::Log(false)),
+                (M::COMMAND | M::SHIFT, Key::End, Mv::Log(true)),
+                (M::SHIFT, Key::ArrowUp, Mv::Rows(-1)),
+                (M::SHIFT, Key::ArrowDown, Mv::Rows(1)),
+                (M::SHIFT, Key::PageUp, Mv::Rows(-page)),
+                (M::SHIFT, Key::PageDown, Mv::Rows(page)),
+                (M::SHIFT, Key::ArrowLeft, Mv::Char(-1)),
+                (M::SHIFT, Key::ArrowRight, Mv::Char(1)),
+                (M::SHIFT, Key::Home, Mv::Line(false)),
+                (M::SHIFT, Key::End, Mv::Line(true)),
+            ];
+            let (mvs, all, copy, esc) = ui.input_mut(|i| {
+                let mvs: Vec<Mv> = table.iter().flat_map(|&(m, k, mv)| std::iter::repeat_n(mv, i.count_and_consume_key(m, k))).collect();
+                let copy = has_sel && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                if copy {
+                    i.events.retain(|e| !matches!(e, egui::Event::Copy));
+                }
+                (mvs, i.consume_key(M::COMMAND, Key::A), copy, has_sel && i.consume_key(M::NONE, Key::Escape))
+            });
+            if copy {
+                ui.ctx().copy_text(self.selected_text(&b));
+            }
+            if esc {
+                (sel, self.hold) = (None, false);
+            }
+            if all {
+                let li = line_at(n - 1);
+                (sel, marks, self.hold) = (Some(Sel { anchor: (0, 0), head: len(li), unit: 1 }), [line_at(0), li], true);
+            }
+            if !mvs.is_empty() {
+                // Without a selection it starts at the first line on screen.
+                let mut h = match sel {
+                    Some(s) => (marks[1], s.head),
+                    None => at_row(((self.last_off / row_sp).ceil() as usize).min(total - 1), 0),
+                };
+                if sel.is_none() {
+                    (sel, marks[0]) = (Some(Sel { anchor: (h.1, h.1), head: h.1, unit: 1 }), h.0);
+                }
+                for mv in mvs {
+                    h = match mv {
+                        Mv::Rows(d) => {
+                            let r = row_of(h);
+                            let col = h.1.saturating_sub((r - rows_of(vi_of(h.0)).start) * if self.wrap { cols } else { 0 });
+                            at_row(r.saturating_add_signed(d).min(total - 1), col)
+                        }
+                        Mv::Char(-1) if h.1 == 0 => match vi_of(h.0) {
+                            0 => h,
+                            vi => (line_at(vi - 1), len(line_at(vi - 1))),
+                        },
+                        Mv::Char(1) if h.1 >= len(h.0) => match vi_of(h.0) + 1 {
+                            vi if vi < n => (line_at(vi), 0),
+                            _ => h,
+                        },
+                        Mv::Char(d) => (h.0, h.1.saturating_add_signed(d).min(len(h.0))),
+                        Mv::Line(end) => (h.0, if end { len(h.0) } else { 0 }),
+                        Mv::Log(false) => (line_at(0), 0),
+                        Mv::Log(true) => (line_at(n - 1), len(line_at(n - 1))),
+                    };
+                }
+                if let Some(s) = &mut sel {
+                    (s.head, s.unit, marks[1]) = (h.1, 1, h.0);
+                }
+                self.hold = true;
+                // Keep the moving end on screen.
+                let y = row_of(h) as f32 * row_sp;
+                if y < self.last_off {
+                    self.set_offset = Some(y);
+                } else if y + row_sp > self.last_off + self.view_h {
+                    self.set_offset = Some(y + row_sp - self.view_h);
+                }
+            }
+        }
+
+        // Under the scroll bars (added later, so they stay on top): presses and drags that select.
+        let resp = ui.interact(area, ui.id().with("log-select"), egui::Sense::click_and_drag());
         let mut sa = egui::ScrollArea::new([!self.wrap, true]).id_salt(("logs", &self.title, self.epoch)).auto_shrink(false).stick_to_bottom(self.follow && !self.hold);
         if let Some(y) = self.set_offset.take() {
             // Past the end show_rows draws no rows and the offset turns infinite: a black log for good.
             sa = sa.vertical_scroll_offset(y.min((total as f32 * row_sp - self.view_h).max(0.0)));
         }
         let max_w = (b.max_chars as usize + 60) as f32 * gw;
+        let scroll_by = std::mem::take(&mut self.scroll_by);
+        let sel_range = sel.map(|s| s.range(marks)).filter(|(a, e)| a != e);
+        let sel_color = ui.visuals().selection.bg_fill;
+        let mut drawn: Vec<Drawn> = vec![];
         let out = sa.show_rows(ui, row_h, total, |ui, range| {
-            // Arrows and Page Up/Down scroll the log under the pointer, unless a text field has the keys.
-            if ui.rect_contains_pointer(ui.clip_rect()) && !ui.ctx().text_edit_focused() {
+            // The arrows and Page Up/Down scroll.
+            let mut by = scroll_by;
+            if keys {
                 let page = (self.view_h - row_sp).max(row_sp);
-                let by = ui.input_mut(|i| {
+                by += ui.input_mut(|i| {
                     let mut k = |key, by: egui::Vec2| by * i.count_and_consume_key(egui::Modifiers::NONE, key) as f32;
                     k(egui::Key::ArrowUp, egui::vec2(0.0, row_sp)) + k(egui::Key::ArrowDown, egui::vec2(0.0, -row_sp))
                         + k(egui::Key::PageUp, egui::vec2(0.0, page)) + k(egui::Key::PageDown, egui::vec2(0.0, -page))
                         + k(egui::Key::ArrowLeft, egui::vec2(4.0 * gw, 0.0)) + k(egui::Key::ArrowRight, egui::vec2(-4.0 * gw, 0.0))
                 });
-                if by != egui::Vec2::ZERO {
-                    ui.scroll_with_delta_animation(by, egui::style::ScrollAnimation::none());
-                }
+            }
+            if by != egui::Vec2::ZERO {
+                ui.scroll_with_delta_animation(by, egui::style::ScrollAnimation::none());
             }
             if !self.wrap {
                 ui.set_min_width(max_w);
             }
+            let (left, top, first) = (ui.max_rect().left(), ui.max_rect().top(), range.start);
             for r in range {
                 let (vi, part) = if self.wrap { (self.rows.partition_point(|&p| p as usize <= r).saturating_sub(1), 0) } else { (r, 0) };
                 let part = if self.wrap { r - first_row(vi) } else { part };
@@ -1121,10 +1314,72 @@ impl LogTab {
                 };
                 let job = self.line_job(l, &font, text_color, weak, &hits, cur);
                 let job = if self.wrap { slice_job(&job, char_byte(&job.text, part * cols), char_byte(&job.text, (part + 1) * cols)) } else { job };
-                ui.add(egui::Label::new(job).extend());
+                let chars = len(li);
+                let (c0, c1) = if self.wrap { (part * cols, ((part + 1) * cols).min(chars)) } else { (0, chars) };
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                let rect = egui::Rect::from_min_size(egui::pos2(left, top + (r - first) as f32 * row_sp), egui::vec2(galley.size().x, row_h));
+                // The selection behind the text; a line selected up to its end shows its line break.
+                if let Some(((l0, s0), (l1, e1))) = sel_range
+                    && (l0..=l1).contains(&li)
+                {
+                    let s = if li == l0 { s0 } else { 0 }.max(c0);
+                    let (e, eol) = if li == l1 { (e1.min(c1), false) } else { (c1, c1 >= chars) };
+                    if s < e || (eol && s <= e) {
+                        let x = |c: usize| rect.left() + galley.pos_from_cursor(egui::text::CCursor::new(c - c0)).min.x;
+                        let x1 = if eol { x(e) + gw * 0.6 } else { x(e) };
+                        ui.painter().rect_filled(egui::Rect::from_x_y_ranges(x(s)..=x1, rect.y_range()), 0.0, sel_color);
+                    }
+                }
+                ui.painter().galley(rect.min, galley.clone(), text_color);
+                drawn.push(Drawn { li, c0, c1, rect, galley });
             }
         });
-        self.hold &= ui.ctx().plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
+
+        // The pointer selects: a press starts it (a double press takes the word, a triple the line;
+        // with Shift it extends), dragging moves the end, and past an edge the log scrolls along.
+        if resp.hovered() {
+            ui.set_cursor_icon(egui::CursorIcon::Text);
+        }
+        let (pressed, down, shift, presses, pos, dt) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.modifiers.shift, i.pointer.press_count(), i.pointer.interact_pos(), i.stable_dt.min(0.1)));
+        if pressed {
+            self.focused = resp.is_pointer_button_down_on();
+        }
+        if let (true, Some(p), Some(last)) = (down && resp.is_pointer_button_down_on(), pos, drawn.last()) {
+            let y = p.y.clamp(drawn[0].rect.top(), last.rect.bottom() - 1.0);
+            let d = drawn.iter().find(|d| y < d.rect.bottom()).unwrap_or(last);
+            let at = (d.li, (d.c0 + d.galley.cursor_from_pos(egui::vec2(p.x - d.rect.left(), row_h / 2.0)).index.0).min(d.c1));
+            let text = || self.shown(&b.lines[at.0]);
+            if pressed && !(shift && sel.is_some()) {
+                let anchor = match presses {
+                    1 => (at.1, at.1),
+                    2 => word_at(&text(), at.1),
+                    _ => (0, len(at.0)),
+                };
+                (sel, marks) = (Some(Sel { anchor, head: anchor.1, unit: presses.min(3) }), [at.0; 2]);
+            } else if let Some(s) = &mut sel {
+                let forward = at >= (marks[0], s.anchor.0);
+                s.head = match s.unit {
+                    1 => at.1,
+                    2 => {
+                        let w = word_at(&text(), at.1);
+                        if forward { w.1 } else { w.0 }
+                    }
+                    _ if forward => len(at.0),
+                    _ => 0,
+                };
+                marks[1] = at.0;
+            }
+            self.hold = sel.is_some_and(|s| s.range(marks).0 != s.range(marks).1);
+            // Past an edge: scroll that way, the faster the farther out.
+            let r = out.inner_rect;
+            let past = |v: f32, lo: f32, hi: f32| if v < lo { v - lo } else if v > hi { v - hi } else { 0.0 };
+            let by = egui::vec2(if self.wrap { 0.0 } else { past(p.x, r.left(), r.right()) }, past(p.y, r.top(), r.bottom()));
+            if by != egui::Vec2::ZERO {
+                self.scroll_by = -by * 15.0 * dt;
+                ui.ctx().request_repaint();
+            }
+        }
+        (self.sel, b.marks) = (sel, marks);
         let (lines, appended) = (b.lines.len(), b.appended);
         // Matches on the scroll track, the current one white (at most one per pixel row).
         if !self.hits.is_empty() && lines > 0 {
@@ -1164,7 +1419,7 @@ impl LogTab {
                 }
             }
         }
-        if ui.rect_contains_pointer(out.inner_rect) {
+        if keys {
             let (home, end) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Home), i.consume_key(egui::Modifiers::COMMAND, egui::Key::End)));
             if home {
                 self.to_start();
@@ -1196,6 +1451,8 @@ thread_local! {
     /// The terminal that takes the keyboard (backend id): the one opened, clicked or brought up
     /// last, until a click somewhere else. Only one at a time, even with several on screen.
     static KEYBOARD: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The pass a terminal holding the keyboard was last drawn in: the logs leave the keys to it.
+    static TERM_KEYS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 pub type Command = (String, Vec<String>);
@@ -1238,6 +1495,9 @@ impl TermTab {
         }
         self.drawn = pass;
         let keys = self.has_keyboard();
+        if keys {
+            TERM_KEYS.with(|t| t.set(Some(pass)));
+        }
         let font = TerminalFont::new(FontSettings { font_type: FontId::monospace(14.0 * size) });
         let view = TerminalView::new(ui, &mut self.backend).set_focus(keys).set_size(ui.available_size()).set_font(font);
         let r = ui.add(view);
@@ -1513,54 +1773,111 @@ mod tests {
         assert_eq!(s.sections[1].byte_range.start.0, 1);
     }
 
-    /// Selecting in a followed log while lines stream in: the selection stays; the keys scroll.
+    /// Selecting in a log as in an editor, while lines stream in; the keys scroll.
     #[tokio::test]
     async fn log_selection_and_keys() {
-        use egui::{Event, Key, PointerButton, Pos2, RawInput, Rect, vec2};
+        use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
         let ctx = egui::Context::default();
         let client = kube::Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
         let mut t = LogTab::new(&ctx, client, vec![], None);
+        t.show_ts = false; // lines read "[?] line N ..."
         let mut n = 0;
         let mut add = |t: &LogTab, k: usize| {
             for _ in 0..k {
                 n += 1;
-                let text = format!("line {n} some text to select");
+                let text = format!("line {n} some-text to select");
                 t.buf.lock().unwrap().insert(Line { ts: Some(jiff::Timestamp::new(1_790_000_000 + n, 0).unwrap()), src: 0, chars: text.len() as u32, text, spans: vec![] }, true);
             }
         };
         add(&t, 300);
-        let frame = |t: &mut LogTab, events: Vec<Event>, k: f64| {
+        let mut k = 0.0;
+        let mut frame = |t: &mut LogTab, events: Vec<Event>| {
+            k += 1.0;
             let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 500.0))), events, time: Some(k * 0.05), ..Default::default() };
             let _ = ctx.run_ui(input, |ui| t.lines_ui(ui));
         };
         let btn = |p: Pos2, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Default::default() };
-        let key = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
-        let (a, b) = (Pos2::new(80.0, 200.0), Pos2::new(400.0, 300.0));
-        let mut script = vec![vec![Event::PointerMoved(a)], vec![Event::PointerMoved(a)], vec![btn(a, true)]];
-        script.extend((1..=10).map(|i| vec![Event::PointerMoved(a + (b - a) * (i as f32 / 10.0))]));
-        script.extend([vec![btn(b, false)], vec![], vec![]]);
-        for (k, events) in script.into_iter().enumerate() {
-            add(&t, 1); // a busy log: a line every frame
-            frame(&mut t, events, k as f64);
-        }
-        let selected = || ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
-        assert!(selected() && t.hold, "the selection survives the new lines");
-        // Escape drops it and the log follows again.
-        frame(&mut t, vec![key(Key::Escape)], 20.0);
-        frame(&mut t, vec![], 21.0);
-        assert!(!selected());
-        add(&t, 5);
-        frame(&mut t, vec![], 22.0);
-        frame(&mut t, vec![], 23.0);
-        assert!(!t.hold);
+        let key = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let drag = |t: &mut LogTab, frame: &mut dyn FnMut(&mut LogTab, Vec<Event>), a: Pos2, b: Pos2, hold: usize, stream: &mut dyn FnMut(&LogTab)| {
+            for events in [vec![Event::PointerMoved(a)], vec![Event::PointerMoved(a)], vec![btn(a, true)]] {
+                frame(t, events);
+            }
+            for i in 1..=10 {
+                stream(t); // a busy log: a line every frame
+                frame(t, vec![Event::PointerMoved(a + (b - a) * (i as f32 / 10.0))]);
+            }
+            for _ in 0..hold {
+                frame(t, vec![]);
+            }
+            frame(t, vec![btn(b, false)]);
+        };
+        frame(&mut t, vec![]);
+        frame(&mut t, vec![]);
+        let rows = |t: &LogTab| t.selected_text(&t.buf.lock().unwrap()).lines().map(String::from).collect::<Vec<_>>();
+
+        // Drag across lines of a followed log: the selection stays on its lines.
+        drag(&mut t, &mut frame, Pos2::new(60.0, 200.0), Pos2::new(400.0, 300.0), 0, &mut |t| add(t, 1));
+        let sel = rows(&t);
+        assert!(t.hold && sel.len() > 3, "{sel:?}");
+        assert!(sel[1].starts_with("[?] line ") && sel.windows(2).all(|w| w[0] != w[1]), "{sel:?}");
+        // Shift+Down: one line more; Shift+End: to its end.
+        frame(&mut t, vec![key(Key::ArrowDown, Modifiers::SHIFT), key(Key::End, Modifiers::SHIFT)]);
+        let more = rows(&t);
+        assert_eq!(more.len(), sel.len() + 1);
+        assert!(more.last().unwrap().ends_with("to select"), "{more:?}");
+        // Ctrl+A and copy: every line.
+        frame(&mut t, vec![key(Key::A, Modifiers::COMMAND)]);
+        assert_eq!(rows(&t).len(), t.buf.lock().unwrap().lines.len());
+        frame(&mut t, vec![Event::Copy]);
+        // Escape drops it.
+        frame(&mut t, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(rows(&t).is_empty() && !t.hold);
+
+        // A double press takes the word.
+        let w = Pos2::new(60.0, 250.0);
+        frame(&mut t, vec![Event::PointerMoved(w)]);
+        frame(&mut t, vec![btn(w, true)]);
+        frame(&mut t, vec![btn(w, false)]);
+        frame(&mut t, vec![btn(w, true)]);
+        frame(&mut t, vec![btn(w, false)]);
+        assert_eq!(rows(&t).len(), 1);
+        let word = rows(&t)[0].clone();
+        assert!(!word.contains(' ') && !word.is_empty(), "{word:?}");
+
+        // Dragging past the bottom edge scrolls on and takes the lines that come into view.
+        t.to_start();
+        frame(&mut t, vec![]);
+        frame(&mut t, vec![]);
+        let top = t.last_off;
+        drag(&mut t, &mut frame, Pos2::new(60.0, 100.0), Pos2::new(400.0, 560.0), 30, &mut |_| {});
+        assert!(t.last_off > top + 100.0, "scrolled: {top} -> {}", t.last_off);
+        let far = rows(&t).len();
+        assert!(far as f32 > t.view_h / 17.0 + 5.0, "{far} lines selected in a {} px view", t.view_h);
+        frame(&mut t, vec![key(Key::Escape, Modifiers::NONE)]);
+
+        // Page Up, then the down arrow, scroll.
+        t.to_end();
+        frame(&mut t, vec![]);
+        frame(&mut t, vec![]);
         let bottom = t.last_off;
-        // Page Up, then the down arrow.
-        frame(&mut t, vec![key(Key::PageUp)], 24.0);
-        frame(&mut t, vec![], 25.0);
+        frame(&mut t, vec![key(Key::PageUp, Modifiers::NONE)]);
+        frame(&mut t, vec![]);
         let paged = t.last_off;
         assert!(paged < bottom - t.view_h / 2.0, "page up: {bottom} -> {paged}");
-        frame(&mut t, vec![key(Key::ArrowDown)], 26.0);
-        frame(&mut t, vec![], 27.0);
+        frame(&mut t, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        frame(&mut t, vec![]);
         assert!(t.last_off > paged && t.last_off < paged + t.view_h / 2.0, "arrow down: {paged} -> {}", t.last_off);
+    }
+
+    #[test]
+    fn words_to_select() {
+        let w = |t: &str, i| {
+            let (a, b) = word_at(t, i);
+            t.chars().skip(a).take(b - a).collect::<String>()
+        };
+        assert_eq!(w("pod api-gateway-7d9f8c failed: OOM", 6), "api-gateway-7d9f8c");
+        assert_eq!(w("pod api-gateway-7d9f8c failed: OOM", 25), "failed");
+        assert_eq!(w("{\"ip\":\"10.42.1.37\"}", 10), "10.42.1.37");
+        assert_eq!(w("a  b", 2), " ");
     }
 }
