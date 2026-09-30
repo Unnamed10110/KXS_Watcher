@@ -1442,8 +1442,9 @@ impl Ready {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if let Some(l) = &mut pt.list {
-                let r = ui_kit::search_field(ui, &mut l.search, "Filter by name, label or node", Some("Ctrl F"), 280.0)
-                    .on_hover_text("jpts*|ingenico*|as400* keeps whatever contains jpts, ingenico or as400 (| or, * anything)");
+                let r = ui_kit::search_field(ui, &mut l.search, "Filter by name", Some("Ctrl F"), 280.0)
+                    .on_hover_text("Names only: jpts*|ingenico*|as400* keeps the names containing jpts, ingenico or as400 (| or, * anything).
+Ctrl+K finds text in every column.");
                 if std::mem::take(&mut self.focus_filter) {
                     r.request_focus();
                 }

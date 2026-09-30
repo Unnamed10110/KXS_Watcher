@@ -264,7 +264,8 @@ impl List {
             .rows
             .values()
             .filter(|r| status_col.is_none_or(|(i, b)| pod_bucket(r.cells.get(i).map_or("", |s| s)) == b))
-            .filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name) || f.hit(&r.namespace) || r.cells.iter().any(|c| f.hit(c)) || r.images.iter().any(|i| f.hit(i))))
+            // The filter box (Ctrl+F) looks at names only; Ctrl+K finds text in every column.
+            .filter(|r| filt.as_ref().is_none_or(|f| f.hit(&r.name)))
             .cloned()
             .collect();
         (self.view, self.groups) = if is_event(kind) { group_events(rows, &d.cols) } else { (rows, HashMap::new()) };
@@ -290,7 +291,7 @@ impl List {
                 if asc { o } else { o.reverse() }
             }),
         }
-        self.filter_hits = filt.as_ref().map_or(0, |f| self.view.iter().map(|r| r.cells.iter().chain([&r.namespace]).chain(&r.images).map(|c| f.ranges(c).len()).sum::<usize>()).sum());
+        self.filter_hits = filt.as_ref().map_or(0, |f| self.view.iter().map(|r| f.ranges(&r.name).len()).sum());
         self.filter_m = filt;
         // Drop selections of rows that are gone.
         let live: HashSet<&String> = d.rows.keys().collect();
@@ -451,10 +452,10 @@ impl List {
                                 let b = status_i.and_then(|i| r.cells.get(i)).map_or("Running", |s| pod_bucket(s));
                                 ui_kit::dot(ui, bucket_color(b), 3.5);
                             }
-                            // Ctrl+K matches, else the filter's (never current: they're not stepped through).
+                            // Ctrl+K matches, else the filter's in the name (never current: not stepped through).
                             let mut hits = matcher.as_ref().map(|mt| mt.ranges(&text)).unwrap_or_default();
                             let find_hits = !hits.is_empty();
-                            if !find_hits {
+                            if !find_hits && is_name {
                                 hits = self.filter_m.as_ref().map(|f| f.ranges(&text)).unwrap_or_default();
                             }
                             if hits.is_empty() && *c == DCol::Images && !text.is_empty() {
@@ -595,6 +596,9 @@ mod tests {
             let r = row(n, "1", &[n]);
             d.rows.insert(r.uid.clone(), r);
         }
+        // Only names count: a match in another column (an image, a node) doesn't keep the row.
+        let other = row("api-tms", "1", &["api-tms", "registry/jpts-base:1.0"]);
+        d.rows.insert(other.uid.clone(), other);
         let m = Metrics::default();
         for re in [false, true] {
             (l.filter_re, l.search) = (re, "jpts*|ingenico*|as400*".into());
@@ -606,7 +610,7 @@ mod tests {
         }
         (l.filter_re, l.search) = (false, " | ".into()); // nothing but separators: everything
         l.refresh(&d, &m);
-        assert_eq!(l.view.len(), 5);
+        assert_eq!(l.view.len(), 6);
     }
 
     #[test]

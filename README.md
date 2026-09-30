@@ -24,8 +24,9 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   Files edited, added or removed on disk (kubectl config, other tools) update the list within seconds.
 - **Live lists** for every resource kind, including CRDs, built from the API server's Table
   output (the same columns as `kubectl get`, `Wide` = `-o wide`). Multi-namespace filter, search, sort,
-  status colors, CPU/memory columns for pods and nodes (metrics-server). The filter works like Lens:
-  `jpts*|ingenico*|as400*` keeps whatever contains jpts, ingenico or as400 (`|` or, `*` anything);
+  status colors, CPU/memory columns for pods and nodes (metrics-server). The filter (Ctrl+F) looks at names only,
+  like Lens: `jpts*|ingenico*|as400*` keeps the names containing jpts, ingenico or as400 (`|` or, `*` anything);
+  Ctrl+K finds text in every column;
   `.*` switches to a full regular expression. Alt codes (Alt+124 for `|`) type in every text box.
 - **Multi-select**: checkboxes, Ctrl/Shift+click, Ctrl+A. Bulk open, merged logs, restart, scale,
   edit YAML, copy names, delete (one confirmation, one summary).
