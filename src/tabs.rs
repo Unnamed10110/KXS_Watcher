@@ -509,6 +509,8 @@ pub struct LogTab {
     rows: Vec<u32>,
     rows_key: (u64, u64, usize, bool, bool, usize),
     set_offset: Option<f32>,
+    /// Text is being selected: the view holds still (new lines scrolling in would drop the selection).
+    hold: bool,
     last_off: f32,
     view_h: f32,
     /// Buffer length when the view left the bottom: the lines after it are new ("Ir al final").
@@ -558,6 +560,7 @@ impl LogTab {
             rows: vec![],
             rows_key: Default::default(),
             set_offset: None,
+            hold: false,
             last_off: 0.0,
             view_h: 0.0,
             away_from: None,
@@ -986,7 +989,7 @@ impl LogTab {
     }
 
     fn to_end(&mut self) {
-        (self.follow, self.set_offset, self.away_from) = (true, Some(f32::MAX), None);
+        (self.follow, self.set_offset, self.away_from, self.hold) = (true, Some(f32::MAX), None, false);
     }
 
     fn visible_text(&self) -> String {
@@ -1069,13 +1072,35 @@ impl LogTab {
         }
 
         let (text_color, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
-        let mut sa = egui::ScrollArea::new([!self.wrap, true]).id_salt(("logs", &self.title, self.epoch)).auto_shrink(false).stick_to_bottom(self.follow);
+        // A drag or a double/triple press (word, line) on the log starts a selection: hold the view.
+        let area = ui.available_rect_before_wrap();
+        ui.input(|i| {
+            let inside = i.pointer.press_origin().is_some_and(|o| area.contains(o));
+            if i.pointer.any_pressed() {
+                self.hold = inside && i.pointer.press_count() >= 2;
+            }
+            self.hold |= inside && i.pointer.is_decidedly_dragging();
+        });
+        let mut sa = egui::ScrollArea::new([!self.wrap, true]).id_salt(("logs", &self.title, self.epoch)).auto_shrink(false).stick_to_bottom(self.follow && !self.hold);
         if let Some(y) = self.set_offset.take() {
             // Past the end show_rows draws no rows and the offset turns infinite: a black log for good.
             sa = sa.vertical_scroll_offset(y.min((total as f32 * row_sp - self.view_h).max(0.0)));
         }
         let max_w = (b.max_chars as usize + 60) as f32 * gw;
         let out = sa.show_rows(ui, row_h, total, |ui, range| {
+            // Arrows and Page Up/Down scroll the log under the pointer, unless a text field has the keys.
+            if ui.rect_contains_pointer(ui.clip_rect()) && !ui.ctx().text_edit_focused() {
+                let page = (self.view_h - row_sp).max(row_sp);
+                let by = ui.input_mut(|i| {
+                    let mut k = |key, by: egui::Vec2| by * i.count_and_consume_key(egui::Modifiers::NONE, key) as f32;
+                    k(egui::Key::ArrowUp, egui::vec2(0.0, row_sp)) + k(egui::Key::ArrowDown, egui::vec2(0.0, -row_sp))
+                        + k(egui::Key::PageUp, egui::vec2(0.0, page)) + k(egui::Key::PageDown, egui::vec2(0.0, -page))
+                        + k(egui::Key::ArrowLeft, egui::vec2(4.0 * gw, 0.0)) + k(egui::Key::ArrowRight, egui::vec2(-4.0 * gw, 0.0))
+                });
+                if by != egui::Vec2::ZERO {
+                    ui.scroll_with_delta_animation(by, egui::style::ScrollAnimation::none());
+                }
+            }
             if !self.wrap {
                 ui.set_min_width(max_w);
             }
@@ -1099,6 +1124,7 @@ impl LogTab {
                 ui.add(egui::Label::new(job).extend());
             }
         });
+        self.hold &= ui.ctx().plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
         let (lines, appended) = (b.lines.len(), b.appended);
         // Matches on the scroll track, the current one white (at most one per pixel row).
         if !self.hits.is_empty() && lines > 0 {
@@ -1485,5 +1511,56 @@ mod tests {
         assert_eq!(s.text, "cde");
         assert_eq!(s.sections.len(), 2);
         assert_eq!(s.sections[1].byte_range.start.0, 1);
+    }
+
+    /// Selecting in a followed log while lines stream in: the selection stays; the keys scroll.
+    #[tokio::test]
+    async fn log_selection_and_keys() {
+        use egui::{Event, Key, PointerButton, Pos2, RawInput, Rect, vec2};
+        let ctx = egui::Context::default();
+        let client = kube::Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
+        let mut t = LogTab::new(&ctx, client, vec![], None);
+        let mut n = 0;
+        let mut add = |t: &LogTab, k: usize| {
+            for _ in 0..k {
+                n += 1;
+                let text = format!("line {n} some text to select");
+                t.buf.lock().unwrap().insert(Line { ts: Some(jiff::Timestamp::new(1_790_000_000 + n, 0).unwrap()), src: 0, chars: text.len() as u32, text, spans: vec![] }, true);
+            }
+        };
+        add(&t, 300);
+        let frame = |t: &mut LogTab, events: Vec<Event>, k: f64| {
+            let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 500.0))), events, time: Some(k * 0.05), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| t.lines_ui(ui));
+        };
+        let btn = |p: Pos2, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let (a, b) = (Pos2::new(80.0, 200.0), Pos2::new(400.0, 300.0));
+        let mut script = vec![vec![Event::PointerMoved(a)], vec![Event::PointerMoved(a)], vec![btn(a, true)]];
+        script.extend((1..=10).map(|i| vec![Event::PointerMoved(a + (b - a) * (i as f32 / 10.0))]));
+        script.extend([vec![btn(b, false)], vec![], vec![]]);
+        for (k, events) in script.into_iter().enumerate() {
+            add(&t, 1); // a busy log: a line every frame
+            frame(&mut t, events, k as f64);
+        }
+        let selected = || ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
+        assert!(selected() && t.hold, "the selection survives the new lines");
+        // Escape drops it and the log follows again.
+        frame(&mut t, vec![key(Key::Escape)], 20.0);
+        frame(&mut t, vec![], 21.0);
+        assert!(!selected());
+        add(&t, 5);
+        frame(&mut t, vec![], 22.0);
+        frame(&mut t, vec![], 23.0);
+        assert!(!t.hold);
+        let bottom = t.last_off;
+        // Page Up, then the down arrow.
+        frame(&mut t, vec![key(Key::PageUp)], 24.0);
+        frame(&mut t, vec![], 25.0);
+        let paged = t.last_off;
+        assert!(paged < bottom - t.view_h / 2.0, "page up: {bottom} -> {paged}");
+        frame(&mut t, vec![key(Key::ArrowDown)], 26.0);
+        frame(&mut t, vec![], 27.0);
+        assert!(t.last_off > paged && t.last_off < paged + t.view_h / 2.0, "arrow down: {paged} -> {}", t.last_off);
     }
 }

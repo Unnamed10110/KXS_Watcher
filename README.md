@@ -40,7 +40,8 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
 - **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
   wrap, timestamps and pod name (on by default), previous container, ⬆ Start / ⬇ End (Ctrl+Home /
-  Ctrl+End; scrolled up, "N new lines · Go to end" appears), find matches marked on the scroll track, Ctrl+F find (plain or regex, only-matching), scrolling to the
+  Ctrl+End; scrolled up, "N new lines · Go to end" appears), Page Up / Page Down and the arrows scroll,
+  selecting text holds a followed log still until the selection is cleared, find matches marked on the scroll track, Ctrl+F find (plain or regex, only-matching), scrolling to the
   top loads earlier lines, dropped connections resume on their own. **📅 Logs by date** (a dialog) shows a
   date range, From and To: `2026-09-28 14:30`, `14:30` (today), `2h` / `30m` / `1d` ago, a UTC timestamp
   copied from a line, or Last 15 min / 1 h / 6 h / 24 h / Today / Yesterday; To empty keeps following.
