@@ -569,6 +569,10 @@ pub struct LogTab {
     hold: bool,
     /// The last press was on this log: the keys go here even with the pointer elsewhere.
     focused: bool,
+    /// Where a press landed inside the selection, and whether the drag out of the window was asked for
+    /// already: moving on drags the selected text out, letting go without moving collapses the selection
+    /// to that point.
+    drag_src: Option<(egui::Pos2, bool)>,
     /// Scrolling asked for last frame (a selection dragged past an edge), applied in the next.
     scroll_by: egui::Vec2,
     last_off: f32,
@@ -623,6 +627,7 @@ impl LogTab {
             sel: None,
             hold: false,
             focused: false,
+            drag_src: None,
             scroll_by: egui::Vec2::ZERO,
             last_off: 0.0,
             view_h: 0.0,
@@ -1278,6 +1283,7 @@ impl LogTab {
         let sel_range = sel.map(|s| s.range(marks)).filter(|(a, e)| a != e);
         let sel_color = ui.visuals().selection.bg_fill;
         let mut drawn: Vec<Drawn> = vec![];
+        let mut sel_rects: Vec<egui::Rect> = vec![];
         let out = sa.show_rows(ui, row_h, total, |ui, range| {
             // The arrows and Page Up/Down scroll.
             let mut by = scroll_by;
@@ -1327,7 +1333,9 @@ impl LogTab {
                     if s < e || (eol && s <= e) {
                         let x = |c: usize| rect.left() + galley.pos_from_cursor(egui::text::CCursor::new(c - c0)).min.x;
                         let x1 = if eol { x(e) + gw * 0.6 } else { x(e) };
-                        ui.painter().rect_filled(egui::Rect::from_x_y_ranges(x(s)..=x1, rect.y_range()), 0.0, sel_color);
+                        let hl = egui::Rect::from_x_y_ranges(x(s)..=x1, rect.y_range());
+                        ui.painter().rect_filled(hl, 0.0, sel_color);
+                        sel_rects.push(hl);
                     }
                 }
                 ui.painter().galley(rect.min, galley.clone(), text_color);
@@ -1344,10 +1352,32 @@ impl LogTab {
         if pressed {
             self.focused = resp.is_pointer_button_down_on();
         }
-        if let (true, Some(p), Some(last)) = (down && resp.is_pointer_button_down_on(), pos, drawn.last()) {
-            let y = p.y.clamp(drawn[0].rect.top(), last.rect.bottom() - 1.0);
+        // The line and char at a point; rows past the ends count as the first or last one on screen.
+        let at_pos = |p: egui::Pos2| {
+            let (first, last) = (drawn.first()?, drawn.last()?);
+            let y = p.y.clamp(first.rect.top(), last.rect.bottom() - 1.0);
             let d = drawn.iter().find(|d| y < d.rect.bottom()).unwrap_or(last);
-            let at = (d.li, (d.c0 + d.galley.cursor_from_pos(egui::vec2(p.x - d.rect.left(), row_h / 2.0)).index.0).min(d.c1));
+            Some((d.li, (d.c0 + d.galley.cursor_from_pos(egui::vec2(p.x - d.rect.left(), row_h / 2.0)).index.0).min(d.c1)))
+        };
+        // A single press inside the selection keeps it: moving on drags the text out of the window to
+        // another program, letting go without moving collapses the selection to that point.
+        if let (true, Some(p)) = (pressed && presses == 1 && !shift && resp.is_pointer_button_down_on(), pos) {
+            self.drag_src = sel_rects.iter().any(|r| r.contains(p)).then_some((p, false));
+        }
+        let armed = self.drag_src;
+        if let Some((p0, sent)) = armed {
+            if !down {
+                self.drag_src = None;
+                if let Some(at) = at_pos(p0).filter(|_| !sent) {
+                    (sel, marks) = (Some(Sel { anchor: (at.1, at.1), head: at.1, unit: 1 }), [at.0; 2]);
+                    self.hold = false;
+                }
+            } else if !sent && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+                self.drag_src = Some((p0, true));
+                ui.ctx().kxs_request_drag_out(self.selected_text(&b));
+            }
+        }
+        if let (true, Some(p), Some(at)) = (down && resp.is_pointer_button_down_on() && armed.is_none(), pos, pos.and_then(at_pos)) {
             let text = || self.shown(&b.lines[at.0]);
             if pressed && !(shift && sel.is_some()) {
                 let anchor = match presses {
@@ -1867,6 +1897,44 @@ mod tests {
         frame(&mut t, vec![key(Key::ArrowDown, Modifiers::NONE)]);
         frame(&mut t, vec![]);
         assert!(t.last_off > paged && t.last_off < paged + t.view_h / 2.0, "arrow down: {paged} -> {}", t.last_off);
+
+        // A press inside a selection keeps it, and moving on asks to drag its text out of the window.
+        let free = |t: &mut LogTab, frame: &mut dyn FnMut(&mut LogTab, Vec<Event>)| {
+            frame(t, vec![Event::PointerMoved(Pos2::new(600.0, 450.0))]);
+            frame(t, vec![btn(Pos2::new(600.0, 450.0), true)]);
+            frame(t, vec![btn(Pos2::new(600.0, 450.0), false)]);
+        };
+        free(&mut t, &mut frame);
+        drag(&mut t, &mut frame, Pos2::new(60.0, 200.0), Pos2::new(400.0, 300.0), 0, &mut |_| {});
+        let picked = rows(&t);
+        assert!(picked.len() > 3, "{picked:?}");
+        assert!(ctx.kxs_take_drag_out().is_none());
+        let inside = Pos2::new(100.0, 250.0);
+        frame(&mut t, vec![Event::PointerMoved(inside)]);
+        frame(&mut t, vec![btn(inside, true)]);
+        assert_eq!(rows(&t), picked, "the press keeps the selection");
+        assert!(ctx.kxs_take_drag_out().is_none(), "not yet moved");
+        for i in 1..=4 {
+            frame(&mut t, vec![Event::PointerMoved(inside + vec2(10.0 * i as f32, 3.0 * i as f32))]);
+        }
+        assert_eq!(ctx.kxs_take_drag_out().map(|d| d.lines().map(String::from).collect::<Vec<_>>()), Some(picked.clone()));
+        assert_eq!(rows(&t), picked, "the drag does not change the selection");
+        frame(&mut t, vec![btn(inside, false)]);
+        assert_eq!(rows(&t), picked);
+        // A click without moving collapses it, as in an editor.
+        frame(&mut t, vec![Event::PointerMoved(inside)]);
+        frame(&mut t, vec![btn(inside, true)]);
+        frame(&mut t, vec![btn(inside, false)]);
+        frame(&mut t, vec![]);
+        assert!(rows(&t).is_empty() && !t.hold, "{:?}", rows(&t));
+        assert!(ctx.kxs_take_drag_out().is_none());
+        // Outside the selection a press starts a new one, as before.
+        drag(&mut t, &mut frame, Pos2::new(60.0, 200.0), Pos2::new(400.0, 300.0), 0, &mut |_| {});
+        let first = rows(&t);
+        let outside = Pos2::new(60.0, 100.0);
+        drag(&mut t, &mut frame, outside, outside + vec2(200.0, 0.0), 0, &mut |_| {});
+        assert_ne!(rows(&t), first);
+        assert!(ctx.kxs_take_drag_out().is_none());
     }
 
     #[test]

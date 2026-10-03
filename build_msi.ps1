@@ -50,6 +50,7 @@ if (-not $SkipBuild) {
 }
 $exe = Join-Path $meta.target_directory 'release\kxs-watcher.exe'
 if (-not (Test-Path $exe)) { throw "Missing $exe - run without -SkipBuild" }
+Write-Host "Built exe: $exe"
 # The icon build.rs drew for this build (in its OUT_DIR).
 $ico = Get-ChildItem (Join-Path $meta.target_directory 'release\build') -Recurse -Filter kxs.ico -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $ico) { throw "Missing kxs.ico - run without -SkipBuild" }

@@ -29,6 +29,10 @@ http = "1"
 jiff = { version = "0.2", features = ["serde"] }
 anyhow = "1"
 rfd = { version = "0.17.2", default-features = false }
+# Drag selected text out of the window (src/dragout.rs). Both are already built for accesskit; this
+# only adds `windows` features. `windows-core`: the #[implement] macro names it.
+windows-core = "0.62"
+windows = { version = "0.62", features = ["Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_UI_Shell"] }
 
 [profile.dev.package."*"]
 opt-level = 2

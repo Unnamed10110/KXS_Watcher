@@ -2,6 +2,7 @@
 
 mod cluster;
 mod details;
+mod dragout;
 mod find;
 mod icon;
 mod kubeconfig;
@@ -226,6 +227,9 @@ struct App {
     good_window: Option<String>,
     /// Saved log tabs waiting for their cluster to connect.
     pending_docks: Vec<Docked>,
+    /// A text drag out of the window just ended: egui still thinks the button is down (OLE ate the
+    /// release); the pointer was here when it started.
+    drag_released: Option<Pos2>,
     /// Kubeconfig files and their modification times, checked every few seconds.
     kube_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     kube_checked: Instant,
@@ -343,6 +347,7 @@ impl App {
             kube_stamp: kubeconfig::stamp(&settings.paths),
             kube_checked: Instant::now(),
             pending_docks: vec![],
+            drag_released: None,
             paths_text: settings.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
             settings,
             clusters: vec![],
@@ -1241,6 +1246,9 @@ impl eframe::App for App {
         if !typed.is_empty() {
             raw_input.events.push(egui::Event::Text(typed));
         }
+        if let Some(pos) = self.drag_released.take() {
+            raw_input.events.splice(0..0, [egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }, egui::Event::PointerGone]);
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -1372,6 +1380,13 @@ impl eframe::App for App {
         self.settings_ui(&ctx);
         self.custom_accent_ui(&ctx);
         self.toasts_ui(&ctx);
+        // A selection was dragged out of the window: block here until it is dropped (or not).
+        if let Some(text) = ctx.kxs_take_drag_out() {
+            let from = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+            dragout::start(&text);
+            self.drag_released = from;
+            ctx.request_repaint();
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1420,7 +1435,10 @@ fn main() -> eframe::Result {
             .with_title("KXS Watcher")
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::render(256), width: 256, height: 256 }))
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_min_inner_size([900.0, 560.0])
+            // The app takes no dropped files, and winit's drop target aborts if OLE asks it for more
+            // than files while we drag text over our own window (see dragout.rs).
+            .with_drag_and_drop(false),
         event_loop_builder: Some(Box::new(|b| {
             use winit::platform::windows::EventLoopBuilderExtWindows;
             b.with_msg_hook(keys::hook);
