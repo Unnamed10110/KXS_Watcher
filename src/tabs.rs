@@ -26,7 +26,7 @@ use crate::watch::{take, Bg, Pending, GREEN, ORANGE, RED};
 const MAX_LINES: usize = 100_000;
 const TAIL: i64 = 500;
 const MORE: i64 = 1000;
-const TS_WIDTH: usize = 25; // "2026-09-26T11:10:46.495Z "
+const TS_WIDTH: usize = 24; // "2026-09-26 08:10:46.495 "
 
 /// One log line: kubelet timestamp, source (pod/container), text without ANSI codes, color changes.
 pub struct Line {
@@ -40,6 +40,21 @@ pub struct Line {
 impl Line {
     fn same(&self, o: &Line) -> bool {
         self.ts == o.ts && self.src == o.src && self.text == o.text
+    }
+}
+
+/// A timestamp as shown and exported: local time, `2026-09-26 08:10:46.495`.
+fn fmt_ts(t: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> String {
+    t.to_zoned(tz.clone()).strftime("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+/// A raw log line as written to a downloaded file: with the timestamp as shown (local time), or
+/// without it.
+fn export_line(raw: &str, keep_ts: bool, tz: &jiff::tz::TimeZone) -> String {
+    match (split_ts(raw), keep_ts) {
+        (_, false) => split_ts(raw).1.to_owned(),
+        ((Some(t), text), true) => format!("{} {text}", fmt_ts(t, tz)),
+        ((None, _), true) => raw.to_owned(),
     }
 }
 
@@ -326,9 +341,9 @@ async fn pod_infos(client: Client, targets: Vec<(Kind, String, String)>) -> Res<
     Ok(out)
 }
 
-/// Where a log starts: empty for the last lines; a timestamp as shown with Timestamps on (UTC,
-/// ends in `Z`); a local date and/or time (`2026-09-28 14:30`, `2026-09-28`, `14:30` today); or how
-/// long ago (`2h`, `30m`, `1d`, `1h 30m`).
+/// Where a log starts: empty for the last lines; a local date and/or time, as the lines show it
+/// (`2026-09-28 14:30`, `2026-09-28 14:30:05.250`, `2026-09-28`, `14:30` today); a UTC timestamp
+/// (ends in `Z`); or how long ago (`2h`, `30m`, `1d`, `1h 30m`).
 fn parse_since(s: &str, now: &jiff::Zoned) -> Result<Option<jiff::Timestamp>, String> {
     use jiff::civil;
     let s = s.trim();
@@ -428,6 +443,7 @@ async fn download(
     previous: bool,
     (from, to): (Option<jiff::Timestamp>, Option<jiff::Timestamp>),
     keep_ts: bool,
+    tz: jiff::tz::TimeZone,
     only: Option<Matcher>,
     path: PathBuf,
     (done, stop): (Arc<AtomicU64>, Arc<AtomicBool>),
@@ -453,7 +469,7 @@ async fn download(
                 if only.as_ref().is_some_and(|m| !m.hit(&strip_ansi(text).0)) {
                     continue;
                 }
-                let line = if keep_ts { raw.as_str() } else { text };
+                let line = export_line(&raw, keep_ts, &tz);
                 writeln!(out, "{line}")?;
                 done.fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
                 n += 1;
@@ -553,6 +569,8 @@ pub struct LogTab {
     _streams: Vec<Bg>,
     earlier: Option<Pending<Res<Vec<(Vec<Line>, bool)>>>>,
     exhausted: bool,
+    /// The system time zone, for the timestamps (read when the tab opens).
+    tz: jiff::tz::TimeZone,
     anchor: Option<(Option<jiff::Timestamp>, u16, String)>,
     pub find: Find,
     only_matching: bool,
@@ -614,6 +632,7 @@ impl LogTab {
             _streams: vec![],
             earlier: None,
             exhausted: false,
+            tz: jiff::tz::TimeZone::system(),
             anchor: None,
             find: Find::default(),
             only_matching: false,
@@ -691,10 +710,10 @@ impl LogTab {
         let dialog = rfd::AsyncFileDialog::new().set_title("Download logs").set_file_name(name).add_filter("Log", &["log", "txt"]);
         let progress = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
         self.progress = Some(progress.clone());
-        let (client, srcs, previous, keep_ts, c) = (self.client.clone(), self.sources.clone(), self.previous, self.show_ts, ctx.clone());
+        let (client, srcs, previous, keep_ts, tz, c) = (self.client.clone(), self.sources.clone(), self.previous, self.show_ts, self.tz.clone(), ctx.clone());
         self.saving = Some(Pending::spawn(ctx, async move {
             let Some(f) = dialog.save_file().await else { return Ok(None) };
-            download(client, srcs, previous, bounds, keep_ts, only, f.path().to_path_buf(), progress, c).await.map(Some)
+            download(client, srcs, previous, bounds, keep_ts, tz, only, f.path().to_path_buf(), progress, c).await.map(Some)
         }));
     }
 
@@ -718,7 +737,7 @@ impl LogTab {
         let r = egui::Modal::new(egui::Id::new("log-range")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading("Logs by date");
-            ui.label(RichText::new("Local time, unless it ends in Z (as shown with Timestamps). 2h, 30m, 1d: that long ago.").weak());
+            ui.label(RichText::new("Local time, as shown with Timestamps (UTC if it ends in Z). 2h, 30m, 1d: that long ago.").weak());
             ui.add_space(10.0);
             let from_empty = if f.to.trim().is_empty() { "the last 500 lines" } else { "the start of the log" };
             for (label, text, parsed, empty) in [("From", &mut f.from, &from, from_empty), ("To", &mut f.to, &to, "now, and keep following")] {
@@ -899,8 +918,8 @@ impl LogTab {
         let fmt = |c: Color32| TextFormat::simple(font.clone(), c);
         let mut job = LayoutJob::default();
         if self.show_ts {
-            let ts = l.ts.map_or_else(|| " ".repeat(TS_WIDTH - 1), |t| format!("{t:.3}"));
-            job.append(&format!("{ts:<24} "), 0.0, fmt(weak));
+            let ts = l.ts.map_or_else(|| " ".repeat(TS_WIDTH - 1), |t| fmt_ts(t, &self.tz));
+            job.append(&format!("{ts:<w$} ", w = TS_WIDTH - 1), 0.0, fmt(weak));
         }
         if self.show_src {
             let tag = self.sources.get(l.src as usize).map_or("?", |s| s.tag.as_str());
@@ -1743,12 +1762,48 @@ mod tests {
         assert_eq!(at(""), None);
         assert_eq!(at("2026-09-26T11:10:46.495Z").as_deref(), Some("2026-09-26T11:10:46.495Z")); // copied from a line
         assert_eq!(at("2026-09-28 14:30").as_deref(), Some("2026-09-28T17:30:00Z")); // local time
+        assert_eq!(at("2026-09-28 14:30:05.250").as_deref(), Some("2026-09-28T17:30:05.25Z")); // as a line shows it
         assert_eq!(at("2026-09-28").as_deref(), Some("2026-09-28T03:00:00Z"));
         assert_eq!(at("14:30").as_deref(), Some("2026-09-28T17:30:00Z")); // today
         assert_eq!(at("2h").as_deref(), Some("2026-09-28T16:00:00Z"));
         assert_eq!(at("1h 30m").as_deref(), Some("2026-09-28T16:30:00Z"));
         assert_eq!(at("1d").as_deref(), Some("2026-09-27T18:00:00Z"));
         assert!(parse_since("yesterday-ish", &now).is_err());
+    }
+
+    #[test]
+    fn timestamps_show_in_local_time() {
+        let tz = jiff::tz::TimeZone::fixed(jiff::tz::offset(-3));
+        let at = |s: &str| fmt_ts(s.parse().unwrap(), &tz);
+        assert_eq!(at("2026-10-06T10:45:29.265Z"), "2026-10-06 07:45:29.265");
+        assert_eq!(at("2026-10-06T02:00:00Z"), "2026-10-05 23:00:00.000"); // the day before
+        assert_eq!(at("2026-10-06T10:45:29.1234567Z"), "2026-10-06 07:45:29.123");
+        // A line as it is written to a file: the shown time, or just the text.
+        let raw = "2026-10-06T10:45:29.265Z hello world";
+        assert_eq!(export_line(raw, true, &tz), "2026-10-06 07:45:29.265 hello world");
+        assert_eq!(export_line(raw, false, &tz), "hello world");
+        assert_eq!(export_line("no timestamp", true, &tz), "no timestamp");
+        assert_eq!(export_line("no timestamp", false, &tz), "no timestamp");
+        // What a line shows can be typed back in the date range.
+        let now: jiff::Zoned = "2026-10-06T12:00:00-03:00[-03:00]".parse().unwrap();
+        let shown = at("2026-10-06T10:45:29.265Z");
+        assert_eq!(parse_since(&shown, &now).unwrap(), Some("2026-10-06T10:45:29.265Z".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn lines_show_the_local_time_aligned() {
+        let ctx = egui::Context::default();
+        let client = kube::Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
+        let mut t = LogTab::new(&ctx, client, vec![], None);
+        t.tz = jiff::tz::TimeZone::fixed(jiff::tz::offset(-3));
+        t.show_src = false;
+        let line = |ts: Option<&str>| Line { ts: ts.map(|s| s.parse().unwrap()), src: 0, text: "hello".into(), spans: vec![], chars: 5 };
+        let shown = t.shown(&line(Some("2026-10-06T10:45:29.265Z")));
+        assert_eq!(shown, "2026-10-06 07:45:29.265 hello");
+        assert_eq!(shown.find("hello"), Some(TS_WIDTH), "the text starts after the prefix the layout counts");
+        assert_eq!(t.shown(&line(None)), format!("{}hello", " ".repeat(TS_WIDTH)));
+        t.show_ts = false;
+        assert_eq!(t.shown(&line(Some("2026-10-06T10:45:29.265Z"))), "hello");
     }
 
     #[test]

@@ -35,22 +35,24 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   ingress backends, role bindings, HPA targets, event objects… plus related pods/ReplicaSets/Jobs.
   Each part (overview, conditions, references, every container, events…) is its own framed block
   with a colored header and a summary (`5 / 5 OK`, `running · 0 restarts`); key/value rows are striped.
+  A single click shows the same details as a column on the right that runs the whole height of the
+  window; the logs dock narrows to its left instead of running under it.
 - **Secret / ConfigMap editor**: edit, add and remove keys, Save (conflicts are detected).
 - **Actions**: edit YAML, create from YAML (multi-document, server-side apply), delete, scale,
   rollout restart, cordon/uncordon, drain, CronJob trigger/suspend, port-forward.
 - **Logs**: one pod or many (interleaved by time, pod name per line), ANSI and log-level colors,
-  wrap, timestamps and pod name (on by default), previous container, ⬆ Start / ⬇ End (Ctrl+Home /
+  wrap, timestamps (your local time, `2026-10-06 07:45:29.265`) and pod name (on by default), previous container, ⬆ Start / ⬇ End (Ctrl+Home /
   Ctrl+End; scrolled up, "N new lines · Go to end" appears), Page Up / Page Down and the arrows scroll,
   text selects as in an editor (drag, and past an edge the log scrolls along; double/triple click for a
   word/line; Shift+click; Shift with the arrows, Page Up/Down and Home/End, with Ctrl for the whole log;
   Ctrl+A, Ctrl+C, Escape), a followed log holds still while something is selected (⬇ End goes live
   again), selected text (logs, details, YAML) can be dragged out of the window into another program, find matches marked on the scroll track, Ctrl+F find (plain or regex, only-matching), scrolling to the
   top loads earlier lines, dropped connections resume on their own. **📅 Logs by date** (a dialog) shows a
-  date range, From and To: `2026-09-28 14:30`, `14:30` (today), `2h` / `30m` / `1d` ago, a UTC timestamp
-  copied from a line, or Last 15 min / 1 h / 6 h / 24 h / Today / Yesterday; To empty keeps following.
+  date range, From and To: `2026-09-28 14:30`, `14:30` (today), `2h` / `30m` / `1d` ago, a timestamp
+  copied from a line (local, or UTC if it ends in Z), or Last 15 min / 1 h / 6 h / 24 h / Today / Yesterday; To empty keeps following.
   It can also find a text in those lines (only matching, regex) and download the range to a file.
   **Save…** writes the shown lines (filter and options applied) to a `.log` file; **⬇ Download all…**
-  streams every line the pod still has (the previous container's with Previous, timestamps with
+  streams every line the pod still has (the previous container's with Previous, local timestamps with
   Timestamps; several pods or containers one after the other), with its size as it goes and Cancel.
 - **Ctrl+K** finds text in the current view (lists, details, YAML, logs): the current match solid amber,
   every other one amber and underlined; the list filter's matches are marked the same way, with a

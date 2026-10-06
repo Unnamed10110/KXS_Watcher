@@ -1311,6 +1311,13 @@ impl eframe::App for App {
         let mut out = Out { node_image: self.settings.node_shell_image.clone(), ..Default::default() };
         let accents = self.settings.accents.clone();
         let tab_font = (self.settings.text_size + 1.5) * ui_kit::factor(ui_kit::Area::Tabs);
+        // The details of the clicked row are a column on the right of the whole window, drawn before the
+        // dock: the dock (logs) gets narrower instead of running under it.
+        let first_new = out.tabs.len();
+        let accent = self.clusters.get(self.cur).and_then(|x| x.cluster.as_ref()).and_then(|id| accents.get(id).copied());
+        if let Some(Body::Cluster(c)) = self.clusters.get_mut(self.cur).map(|t| &mut t.body) {
+            c.details_panel(ui, &mut out, accent);
+        }
         let mut viewer = Viewer { out: &mut out, find_req, claimed: false, term_keys: false, hovered: None, tab_font, accents: &accents };
         let mut dock_hovered = false;
         if self.dock.iter_all_tabs().next().is_some() {
@@ -1348,7 +1355,6 @@ impl eframe::App for App {
             c.close_tab();
         }
 
-        let first_new = out.tabs.len();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg)).show(ui, |ui| {
             let accent = self.clusters.get(self.cur).and_then(|x| x.cluster.clone()).and_then(|id| self.settings.accents.get(&id).copied());
             match self.clusters.get_mut(self.cur) {

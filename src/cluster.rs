@@ -260,6 +260,14 @@ impl ClusterTab {
         }
     }
 
+    /// The details of the clicked row as a column on the right of the whole window, drawn before the
+    /// bottom dock so the dock (logs) is narrower instead of running under it.
+    pub fn details_panel(&mut self, ui: &mut Ui, out: &mut Out, accent: Option<egui::Color32>) {
+        if let Some(r) = &mut self.ready {
+            r.details_panel(ui, out, accent);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, out: &mut Out) {
         if let Some(r) = take(&mut self.conn) {
             match r {
@@ -873,7 +881,6 @@ impl Ready {
         });
         match pages.get_mut(self.cur) {
             Some(pt) => {
-                self.panel_ui(ui, pt, &mut acts);
                 egui::CentralPanel::default().frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 10, bottom: 8 })).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Lists, |ui| self.page_ui(ui, pt, out, &mut acts, &mut ev)));
             }
             None => {
@@ -929,18 +936,38 @@ impl Ready {
         }
     }
 
-    /// Details of the clicked row, right of the list (only on the page view).
-    fn panel_ui(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>) {
+    /// `panel_ui` for the current page, then what it asked for (see `ClusterTab::details_panel`).
+    fn details_panel(&mut self, ui: &mut Ui, out: &mut Out, accent: Option<egui::Color32>) {
+        let ctx = ui.ctx().clone();
+        let (mut acts, mut pages) = (Vec::new(), std::mem::take(&mut self.pages));
+        if let Some(pt) = pages.get_mut(self.cur) {
+            if let Some(p) = &mut pt.panel {
+                p.sync(&ctx); // it is drawn before `Ready::ui` syncs the tabs
+            }
+            self.panel_ui(ui, pt, &mut acts, accent);
+        }
+        self.pages = pages;
+        for (targets, a) in acts {
+            self.act(&ctx, targets, a, out);
+        }
+    }
+
+    /// Details of the clicked row, a column on the right of the window (only on the page view).
+    fn panel_ui(&mut self, ui: &mut Ui, pt: &mut PageTab, acts: &mut Vec<(Vec<Target>, Act)>, accent: Option<egui::Color32>) {
         self.panel_hovered = false;
         if pt.active != 0 {
             return;
         }
         let Some(p) = &mut pt.panel else { return };
         let (mut close, mut to_tab, mut dacts) = (false, false, vec![]);
-        let max = (ui.available_width() - 360.0).max(320.0);
+        // Room left for the navigation and the list.
+        let max = (ui.available_width() - 560.0).max(320.0);
         let t = ui_kit::tokens(ui);
         let frame = egui::Frame::new().fill(t.panel).inner_margin(egui::Margin { left: 18, right: 16, top: 12, bottom: 8 }).stroke(egui::Stroke::new(1.0, t.line));
         let shown = egui::Panel::right(egui::Id::new(("details-panel", self.kctx.id()))).resizable(true).default_size(460.0).size_range(320.0..=max).frame(frame).show(ui, |ui| ui_kit::scaled(ui, ui_kit::Area::Details, |ui| {
+            if let Some(c) = accent {
+                crate::theme::tint(ui.visuals_mut(), c); // the cluster's color, as the page has it
+            }
             ui.horizontal(|ui| {
                 ui_kit::section_label(ui, &p.details.t.kind.ar.kind);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
