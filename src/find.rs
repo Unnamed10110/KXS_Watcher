@@ -256,11 +256,26 @@ fn show(ui: &mut Ui, rt: RichText, link: bool, wrap: bool) -> egui::Response {
         job.sections.iter_mut().for_each(|s| s.format.color = ui.visuals().hyperlink_color);
     }
     overlay(&mut job, &hits, cur);
+    // Only when scrolling to it: where the current match is (a long value is one label).
+    let at = cur.filter(|_| scroll).map(|c| (job.clone(), hits[c].start));
     let r = if link { ui.add(egui::Link::new(job)) } else { ui.add(label(job.into())) };
-    if scroll {
-        ui.scroll_to_rect(r.rect, Some(Align::Center));
+    if let Some((job, at)) = at {
+        ui.scroll_to_rect(spot(ui, job, at, r.rect), Some(Align::Center));
     }
     r
+}
+
+/// Where byte `at` of `job` is on screen, the job drawn in `label`: its own line when the text takes
+/// several (a secret's value, an annotation), else the whole label. Scrolling to the whole of a tall
+/// label would never move between the matches inside it.
+fn spot(ui: &Ui, mut job: LayoutJob, at: usize, label: egui::Rect) -> egui::Rect {
+    job.wrap.max_width = label.width() + 1.0;
+    let chars = job.text[..at].chars().count();
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    if galley.rows.len() < 2 {
+        return label;
+    }
+    galley.pos_from_cursor(egui::text::CCursor::new(chars)).translate(label.min.to_vec2()).expand(24.0)
 }
 
 /// A label that takes part in find-in-view.
@@ -331,6 +346,30 @@ mod tests {
         f.query = "(".into();
         assert!(f.matcher().is_none());
         assert!(Matcher::plain("é", false).ranges("café é").iter().all(|r| "café é".is_char_boundary(r.start)));
+    }
+
+    /// Next/previous match inside one tall label (a secret's value): the view follows the match.
+    #[test]
+    fn scrolls_to_the_match_inside_a_tall_label() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let text: String = (0..100).map(|i| format!("line {i}
+")).collect();
+        let mut f = Find { open: true, query: "line 90".into(), ..Default::default() };
+        let mut offset = 0.0;
+        for pass in 0..4 {
+            f.scroll = pass == 1; // the frame after "next" was pressed
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 120.0))), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                begin(&mut f);
+                let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| wrapped(ui, RichText::new(&text).monospace()));
+                offset = out.state.offset.y;
+                end(&mut f);
+            });
+        }
+        // The label is ~1500 px tall; centring the label itself would stop near its middle.
+        assert!(offset > 1100.0, "line 90 is near the end: offset {offset}");
+        assert_eq!(f.total, 1);
     }
 
     #[test]
