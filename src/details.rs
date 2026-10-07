@@ -977,9 +977,10 @@ impl Details {
         let busy = self.save.is_some();
         let e = self.editing.as_mut()?;
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut e.key).hint_text("key").desired_width(260.0));
-            let rows = e.value.lines().count().clamp(3, 16);
-            ui.add(egui::TextEdit::multiline(&mut e.value).hint_text("value").code_editor().desired_rows(rows).desired_width(ui.available_width()));
+            // Both fields highlight (and count) what the find in the panel is looking for.
+            find::edit(ui, &mut e.key, false, egui::TextStyle::Body, |t| t.hint_text("key").desired_width(260.0));
+            let (rows, width) = (e.value.lines().count().clamp(3, 16), ui.available_width());
+            find::edit(ui, &mut e.value, true, egui::TextStyle::Monospace, |t| t.hint_text("value").code_editor().desired_rows(rows).desired_width(width));
             ui.horizontal(|ui| {
                 save = ui.add_enabled(!busy, egui::Button::new(RichText::new("💾 Save").strong())).clicked();
                 cancel = ui.button("Cancel").clicked();

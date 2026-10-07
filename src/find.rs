@@ -299,6 +299,44 @@ pub fn matches(text: impl FnOnce() -> String) -> bool {
     HL.with(|h| h.borrow().as_ref().is_some_and(|h| h.m.hit(&text())))
 }
 
+/// The text of a field being edited as one job, the active find's matches highlighted. Laid out as
+/// the field itself would (`keep_trailing_whitespace`, single line without wrapping).
+fn edit_job(text: &str, font: egui::FontId, color: Color32, wrap: Option<f32>, m: Option<&Matcher>, cur: Option<usize>) -> LayoutJob {
+    let mut job = match wrap {
+        Some(w) => LayoutJob::simple(text.to_owned(), font, color, w),
+        None => LayoutJob::simple_singleline(text.to_owned(), font, color),
+    };
+    job.keep_trailing_whitespace = true;
+    if let Some(m) = m {
+        overlay(&mut job, &m.ranges(text), cur);
+    }
+    job
+}
+
+/// A text field being edited (a secret's key and value) that takes part in find-in-view like the
+/// labels do: its matches are highlighted as it is laid out (also as it is typed in), count with the
+/// rest and are scrolled to. `build` sets the field up (hint, width, rows); `multiline` and `font`
+/// must be what it uses (`code_editor()` is monospace).
+pub fn edit(ui: &mut Ui, text: &mut String, multiline: bool, font: egui::TextStyle, build: impl for<'a> FnOnce(egui::TextEdit<'a>) -> egui::TextEdit<'a>) -> egui::Response {
+    let claimed = claim(text);
+    let matcher = HL.with(|h| h.borrow().as_ref().map(|h| h.m.clone()));
+    let cur = claimed.as_ref().and_then(|c| c.1);
+    // Where to scroll to, as a char index (the field borrows `text` while it is shown).
+    let scroll_to = claimed.as_ref().and_then(|(hits, cur, scroll)| cur.filter(|_| *scroll).map(|c| text[..hits[c].start].chars().count()));
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+        let (font, color) = (font.resolve(ui.style()), ui.visuals().widgets.inactive.text_color());
+        let job = edit_job(buf.as_str(), font, color, multiline.then_some(wrap), matcher.as_ref(), cur);
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let field = build(if multiline { egui::TextEdit::multiline(text) } else { egui::TextEdit::singleline(text) });
+    let out = if matcher.is_some() { field.layouter(&mut layouter) } else { field }.show(ui);
+    if let Some(ci) = scroll_to {
+        let rect = out.galley.pos_from_cursor(egui::text::CCursor::new(ci)).translate(out.galley_pos.to_vec2()).expand(24.0);
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    out.response.response
+}
+
 /// A hidden value (secret): its matches count and are flagged, the value stays masked.
 pub fn masked(ui: &mut Ui, text: &str) -> egui::Response {
     let dots = RichText::new("•".repeat(12)).monospace();
@@ -370,6 +408,37 @@ mod tests {
         // The label is ~1500 px tall; centring the label itself would stop near its middle.
         assert!(offset > 1100.0, "line 90 is near the end: offset {offset}");
         assert_eq!(f.total, 1);
+    }
+
+    /// Editing a secret's value: the field highlights, counts and scrolls to the find's matches.
+    #[test]
+    fn a_field_being_edited_takes_part_in_find() {
+        let m = Matcher::plain("key", false);
+        let job = edit_job("a key and a KEY", egui::FontId::monospace(12.0), Color32::WHITE, Some(300.0), Some(&m), Some(1));
+        let lit: Vec<_> = job.sections.iter().filter(|s| s.format.background != Color32::TRANSPARENT).map(|s| (s.byte_range.start.0, s.format.background)).collect();
+        assert_eq!(lit, [(2, hit_bg(false)), (12, hit_bg(true))]);
+        assert!(job.keep_trailing_whitespace);
+        assert!(edit_job("plain", egui::FontId::monospace(12.0), Color32::WHITE, None, None, None).sections.iter().all(|s| s.format.background == Color32::TRANSPARENT));
+
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut text: String = (0..100).map(|i| format!("line {i}
+")).collect();
+        let mut f = Find { open: true, query: "line 90".into(), ..Default::default() };
+        let mut offset = 0.0;
+        for pass in 0..4 {
+            f.scroll = pass == 1;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 120.0))), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                begin(&mut f);
+                let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| edit(ui, &mut text, true, egui::TextStyle::Monospace, |t| t.code_editor().desired_rows(3)));
+                offset = out.state.offset.y;
+                end(&mut f);
+            });
+        }
+        assert!(offset > 1100.0, "line 90 is near the end: offset {offset}");
+        assert_eq!(f.total, 1);
+        assert_eq!(text.lines().count(), 100, "nothing was typed");
     }
 
     #[test]
