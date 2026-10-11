@@ -1,12 +1,10 @@
 //! Live resource lists built on the API server's Table output (the columns `kubectl get` prints),
-//! plus the two background-task helpers every view uses.
-use std::cmp::Ordering;
+//! The background-task helpers (`tasks`), the value formatting (`units`) and the status colors (`theme`)
+//! are re-exported here, where the views have always found them.
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use egui::Color32;
 use futures::{AsyncBufReadExt, StreamExt};
 use kube::api::{ApiResource, DynamicObject, ListParams, WatchParams};
 use kube::core::Request;
@@ -14,49 +12,9 @@ use kube::{Client, Resource};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Task handle that aborts on drop: whoever shows the data owns the task.
-pub struct Bg(tokio::task::JoinHandle<()>);
-
-impl Bg {
-    pub fn spawn(f: impl Future<Output = ()> + Send + 'static) -> Self {
-        Bg(tokio::spawn(f))
-    }
-}
-
-impl Drop for Bg {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// One-shot async result polled by the UI each frame.
-pub struct Pending<T>(tokio::sync::oneshot::Receiver<T>);
-
-impl<T: Send + 'static> Pending<T> {
-    pub fn spawn(ctx: &egui::Context, f: impl Future<Output = T> + Send + 'static) -> Self {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(f.await);
-            ctx.request_repaint();
-        });
-        Pending(rx)
-    }
-
-    /// `Some` exactly once, when the task finished.
-    pub fn poll(&mut self) -> Option<T> {
-        self.0.try_recv().ok()
-    }
-}
-
-/// Poll an optional pending slot, clearing it once done.
-pub fn take<T: Send + 'static>(slot: &mut Option<Pending<T>>) -> Option<T> {
-    let r = slot.as_mut()?.poll();
-    if r.is_some() {
-        *slot = None;
-    }
-    r
-}
+pub use crate::tasks::{take, Bg, Lock, Pending};
+pub use crate::theme::{cell_color, GREEN, ORANGE, RED};
+pub use crate::units::{age, cmp_cells, date_cell};
 
 pub const ACCEPT_TABLE: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,application/json";
 
@@ -91,6 +49,8 @@ pub struct ListData {
     /// When the current run of failures started (cleared by a successful sync).
     pub error_since: Option<std::time::Instant>,
     pub synced: bool,
+    /// Marked by whatever draws this data; the watch wakes the window at full pace only while it is.
+    pub shown: crate::repaint::Shown,
 }
 
 impl ListData {
@@ -237,6 +197,29 @@ fn apply(d: &mut ListData, kind: &str, rows: Vec<Row>) -> Option<String> {
     rv
 }
 
+/// The names of everything at a collection path, asked for as a Table without its objects: on a
+/// cluster with many CRDs their metadata alone (annotations) is megabytes, and only names are needed.
+pub async fn names(client: &Client, path: &str) -> anyhow::Result<Vec<String>> {
+    #[derive(Deserialize, Default)]
+    struct Names {
+        #[serde(default)]
+        rows: Vec<NameRow>,
+        /// A plain list, when a server ignores `as=Table`.
+        #[serde(default)]
+        items: Vec<Obj>,
+    }
+    #[derive(Deserialize)]
+    struct NameRow {
+        #[serde(default)]
+        cells: Vec<Value>,
+    }
+    let req = accept_table(http::Request::get(format!("{path}?includeObject=None")).body(vec![])?);
+    let t: Names = client.request(req).await?;
+    let mut names: Vec<String> = t.rows.into_iter().filter_map(|r| r.cells.first().and_then(Value::as_str).map(String::from)).collect();
+    names.extend(t.items.into_iter().map(|o| o.metadata.name));
+    Ok(names)
+}
+
 fn accept_table(mut req: http::Request<Vec<u8>>) -> http::Request<Vec<u8>> {
     req.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(ACCEPT_TABLE));
     req
@@ -258,17 +241,18 @@ pub async fn run(client: Client, ar: ApiResource, ns: Option<String>, fields: Op
     // Pods have no image column in their table: list them with the object to read it.
     let full = ar.group.is_empty() && ar.kind == "Pod";
     let mut backoff = 1;
+    let shown = data.locked().shown.clone();
     loop {
         match sync(&client, &req, ns.as_deref(), fields.as_deref(), full, &data, &ctx).await {
             Ok(()) => backoff = 1, // 410 Gone: relist right away
             Err(e) => {
                 {
-                    let mut d = data.lock().unwrap();
+                    let mut d = data.locked();
                     d.error = Some(crate::ops::err_text(&e));
                     d.error_since.get_or_insert_with(std::time::Instant::now);
                     d.rev += 1;
                 }
-                ctx.request_repaint();
+                shown.wake(&ctx, Duration::ZERO);
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
             }
@@ -278,6 +262,7 @@ pub async fn run(client: Client, ar: ApiResource, ns: Option<String>, fields: Op
 
 async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&str>, full: bool, data: &Shared, ctx: &egui::Context) -> anyhow::Result<()> {
     let shape = |r: http::Request<Vec<u8>>| if full { include_object(accept_table(r)) } else { accept_table(r) };
+    let shown = data.locked().shown.clone();
     let (mut cols, mut rows, mut cont) = (Vec::new(), Vec::new(), None);
     let mut rv = loop {
         let lp = ListParams { limit: Some(500), continue_token: cont.take(), field_selector: fields.map(String::from), ..Default::default() };
@@ -292,7 +277,7 @@ async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&
         cont = Some(meta.cont);
     };
     {
-        let mut d = data.lock().unwrap();
+        let mut d = data.locked();
         d.cols = cols;
         match ns {
             Some(ns) => d.rows.retain(|_, r| r.namespace != ns),
@@ -300,11 +285,13 @@ async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&
         }
         d.rows.extend(rows.into_iter().map(|r| (r.uid.clone(), Arc::new(r))));
         d.synced = true;
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::prof::trace_once(&FIRST, "first list synced");
         d.error = None;
         d.error_since = None;
         d.rev += 1;
     }
-    ctx.request_repaint();
+    shown.wake(ctx, Duration::ZERO);
 
     #[derive(Deserialize)]
     struct Event {
@@ -332,10 +319,10 @@ async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&
                 }
                 "ADDED" | "MODIFIED" | "DELETED" => {
                     let new = event_rows(ev.object)?;
-                    if let Some(v) = apply(&mut data.lock().unwrap(), &ev.kind, new) {
+                    if let Some(v) = apply(&mut data.locked(), &ev.kind, new) {
                         rv = v;
                     }
-                    ctx.request_repaint_after(Duration::from_millis(250));
+                    shown.wake(ctx, Duration::from_millis(250));
                 }
                 _ => {}
             }
@@ -343,95 +330,12 @@ async fn sync(client: &Client, req: &Request, ns: Option<&str>, fields: Option<&
     }
 }
 
-/// kubectl's HumanDuration.
-pub fn human(secs: i64) -> String {
-    let s = secs.max(0);
-    let (m, h) = (s / 60, s / 3600);
-    let d = h / 24;
-    match () {
-        _ if s < 120 => format!("{s}s"),
-        _ if m < 10 && s % 60 == 0 => format!("{m}m"),
-        _ if m < 10 => format!("{m}m{}s", s % 60),
-        _ if m < 180 => format!("{m}m"),
-        _ if h < 8 && m % 60 == 0 => format!("{h}h"),
-        _ if h < 8 => format!("{h}h{}m", m % 60),
-        _ if h < 48 => format!("{h}h"),
-        _ if h < 192 && h % 24 == 0 => format!("{d}d"),
-        _ if h < 192 => format!("{d}d{}h", h % 24),
-        _ if d < 730 => format!("{d}d"),
-        _ if d < 2920 && d % 365 == 0 => format!("{}y", d / 365),
-        _ if d < 2920 => format!("{}y{}d", d / 365, d % 365),
-        _ => format!("{}y", d / 365),
-    }
-}
-
-pub fn age(ts: Option<jiff::Timestamp>) -> String {
-    ts.map(|t| human(jiff::Timestamp::now().as_second() - t.as_second())).unwrap_or_default()
-}
-
-/// Age for a `date` typed cell (RFC3339 string); passes other text through.
-pub fn date_cell(text: &str) -> String {
-    text.parse::<jiff::Timestamp>().map(|t| age(Some(t))).unwrap_or_else(|_| text.to_string())
-}
-
-/// ASCII case-insensitive substring test without allocating.
-pub fn contains_ci(hay: &str, needle: &str) -> bool {
-    needle.is_empty() || hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-fn lead_num(s: &str) -> Option<f64> {
-    let end = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
-    s[..end].parse().ok()
-}
-
-/// Numeric when both cells start with a number (`3`, `1/2`, `5 (3m ago)`), else case-insensitive text.
-// ponytail: ignores units (128Mi vs 1Gi); parse quantities if someone sorts by memory columns.
-pub fn cmp_cells(a: &str, b: &str) -> Ordering {
-    match (lead_num(a), lead_num(b)) {
-        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal).then_with(|| a.cmp(b)),
-        _ => a.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.bytes().map(|c| c.to_ascii_lowercase())),
-    }
-}
-
-pub const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
-pub const ORANGE: Color32 = Color32::from_rgb(210, 153, 34);
-pub const RED: Color32 = Color32::from_rgb(218, 54, 51);
-
-/// Painted status dot (the default fonts have no reliable bullet glyph).
-pub fn dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-}
-
-/// Status coloring for status-like columns.
-pub fn cell_color(col: &str, text: &str) -> Option<Color32> {
-    if !matches!(col, "Status" | "Phase" | "Type" | "Ready" | "Reason" | "Condition") {
-        return None;
-    }
-    if let Some((a, b)) = text.split_once('/') {
-        return match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
-            (Ok(a), Ok(b)) if a < b => Some(ORANGE),
-            _ => None,
-        };
-    }
-    const RED_WORDS: &[&str] = &["NotReady", "Failed", "Error", "BackOff", "ErrImage", "OOMKilled", "Evicted", "Lost", "Invalid", "Unknown", "False", "Unhealthy"];
-    const ORANGE_WORDS: &[&str] = &["Not ready", "SchedulingDisabled", "Pending", "Creating", "Initializing", "Init:", "Terminating", "Released", "Warning", "Progressing", "Suspended"];
-    const GREEN_WORDS: &[&str] = &["Running", "Active", "Bound", "Available", "Succeeded", "Completed", "Complete", "Ready", "True", "deployed", "Healthy"];
-    let has = |ws: &[&str]| ws.iter().any(|w| text.contains(w));
-    if has(RED_WORDS) {
-        Some(RED)
-    } else if has(ORANGE_WORDS) {
-        Some(ORANGE)
-    } else if has(GREEN_WORDS) {
-        Some(GREEN)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::MockApi;
+    use crate::units::human;
+    use std::cmp::Ordering;
 
     const LIST: &str = r#"{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"42"},
       "columnDefinitions":[{"name":"Name","type":"string","format":"name","priority":0},
@@ -462,6 +366,50 @@ mod tests {
         assert_eq!(rv.as_deref(), Some("43"));
         assert_eq!(d.rows.len(), 1);
         assert!(d.rows.contains_key("u2"));
+    }
+
+    /// `sync` against the fake server: (result, what the list holds, the requests made).
+    async fn sync_against(watches: &[&str]) -> (anyhow::Result<()>, ListData, Vec<String>) {
+        let api = MockApi::default().route("watch=true", watches).always("/pods", LIST);
+        let client = api.client();
+        let pod = ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&());
+        let req = Request::new(DynamicObject::url_path(&pod, None));
+        let data: Shared = Default::default();
+        let r = sync(&client, &req, None, None, false, &data, &egui::Context::default()).await;
+        let d = std::mem::take(&mut *data.locked());
+        (r, d, api.requests())
+    }
+
+    fn table_event(kind: &str, name: &str, uid: &str, rv: &str) -> String {
+        format!(r#"{{"type":"{kind}","object":{{"kind":"Table","rows":[{{"cells":["{name}"],"object":{{"metadata":{{"name":"{name}","namespace":"default","uid":"{uid}","resourceVersion":"{rv}"}}}}}}]}}}}"#)
+    }
+
+    #[tokio::test]
+    async fn the_list_follows_watch_events_and_a_410_relists() {
+        let gone = r#"{"type":"ERROR","object":{"code":410,"message":"too old resource version"}}"#;
+        let events = [table_event("ADDED", "web-3", "u3", "44"), table_event("MODIFIED", "web-1", "u1", "45"), table_event("DELETED", "web-2", "u2", "46")].join("\n");
+        // The first watch ends after its events (a closed connection): the next one resumes from the
+        // last resourceVersion seen, and is told it is too old: `sync` returns so `run` relists.
+        let (r, d, seen) = sync_against(&[&events, gone]).await;
+        assert!(r.is_ok(), "410 is not an error: {r:?}");
+        assert!(d.synced && d.error.is_none());
+        let mut uids: Vec<_> = d.rows.keys().cloned().collect();
+        uids.sort();
+        assert_eq!(uids, ["u1", "u3"], "web-3 added, web-2 deleted");
+        assert_eq!(d.rows["u1"].rv, "45", "web-1 modified");
+        assert_eq!(d.cols.len(), 4, "columns come from the list");
+        let watches: Vec<_> = seen.iter().filter(|u| u.contains("watch=true")).collect();
+        assert_eq!(watches.len(), 2);
+        assert!(watches[0].contains("resourceVersion=42"), "the first watch starts at the list's version: {}", watches[0]);
+        assert!(watches[1].contains("resourceVersion=46"), "the second resumes after the last event: {}", watches[1]);
+        assert!(seen[0].contains("limit=500"), "the list is paged: {}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn a_watch_error_is_reported_and_the_list_stays() {
+        let (r, d, _) = sync_against(&[r#"{"type":"ERROR","object":{"code":500,"message":"etcd is not available"}}"#]).await;
+        assert!(r.is_err_and(|e| e.to_string().contains("etcd is not available")));
+        assert_eq!(d.rows.len(), 2, "what was listed stays on screen");
     }
 
     #[test]
@@ -506,5 +454,18 @@ mod tests {
                 "spec":{"containers":[{"name":"app","image":"ghcr.io/x/web:1.2.3"},{"name":"proxy","image":"envoy:v1.30"}]}}}]});
         let (_, rows, _) = parse_list(serde_json::from_value(t).unwrap());
         assert_eq!(rows[0].images, vec!["ghcr.io/x/web:1.2.3", "envoy:v1.30"]);
+    }
+
+    /// The names come from a Table asked for without its objects, or from a plain list.
+    #[tokio::test]
+    async fn names_of_a_collection() {
+        let table = r#"{"kind":"Table","columnDefinitions":[{"name":"Name"},{"name":"Created At"}],"rows":[{"cells":["a.example.com","2026-01-01T00:00:00Z"]},{"cells":["b.example.com","2026-01-02T00:00:00Z"]}]}"#;
+        let api = MockApi::default().always("/customresourcedefinitions", table);
+        assert_eq!(names(&api.client(), "/apis/apiextensions.k8s.io/v1/customresourcedefinitions").await.unwrap(), ["a.example.com", "b.example.com"]);
+        let uri = &api.requests()[0];
+        assert!(uri.contains("includeObject=None"), "{uri}");
+        let plain = r#"{"kind":"CustomResourceDefinitionList","items":[{"metadata":{"name":"c.example.com"}}]}"#;
+        let api = MockApi::default().always("/customresourcedefinitions", plain);
+        assert_eq!(names(&api.client(), "/apis/apiextensions.k8s.io/v1/customresourcedefinitions").await.unwrap(), ["c.example.com"]);
     }
 }

@@ -3,8 +3,8 @@
   Build the release exe and package it as an MSI with WiX (the `wix` dotnet tool, v4 or newer).
 .DESCRIPTION
   The MSI version is -Version, or Cargo.toml's when omitted. The MSI goes to
-  target\KXS-Watcher\KXS-Watcher-<version>-x64.msi (in this repo) and its path is the script's output,
-  so other scripts can use it: $msi = .\build_msi.ps1
+  target\KXS-Watcher\KXS-Watcher-<version>-x64.msi (in this repo), with its SHA-256 in <msi>.sha256, and
+  the MSI path is the script's output, so other scripts can use it: $msi = .\build_msi.ps1
 .PARAMETER Version
   x.y.z for the MSI. Tag forms work too (v0.2.0, v.0.2.0, 0.2.0-rc1): the x.y.z inside is used.
   MSI limits: x and y up to 255, z up to 65535. A higher version replaces a lower one when installed.
@@ -65,4 +65,8 @@ if ($LASTEXITCODE) { throw "wix build failed" }
 
 $mb = [math]::Round((Get-Item $msi).Length / 1MB, 1)
 Write-Host "MSI ($mb MB): $msi" -ForegroundColor Green
+# The checksum goes next to it, in `sha256sum -c` format.
+$sum = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+Set-Content -Path "$msi.sha256" -Value "$sum *$(Split-Path $msi -Leaf)" -Encoding ascii
+Write-Host "SHA-256: $sum"
 $msi

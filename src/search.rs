@@ -1,5 +1,7 @@
 //! Content search across Config Maps and Secrets (all namespaces or the selected ones).
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use egui::{RichText, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -24,8 +26,7 @@ pub struct Entry {
 /// Helm keeps releases in secrets (gzipped, base64 inside): noise for a text search; the Helm page has them.
 const SKIP_TYPES: &[&str] = &["helm.sh/release.v1"];
 
-// ponytail: every text value is held in memory and scanned per keystroke; fine for thousands of keys,
-// move the scan to a background task if huge clusters stutter.
+// Every text value is held in memory and scanned for each query, on a thread (see `Scan`).
 async fn entries(client: &Client, secret: bool, ns: &[String]) -> Result<Vec<Entry>, String> {
     let ar = if secret { ApiResource::erase::<Secret>(&()) } else { ApiResource::erase::<ConfigMap>(&()) };
     let scopes = if ns.is_empty() { vec![String::new()] } else { ns.to_vec() };
@@ -75,12 +76,39 @@ struct Hit {
     snippet: String,
 }
 
-fn search(entries: &[Entry], m: &Matcher) -> Vec<Hit> {
+/// The entries `m` matches; cut short (with what was found so far) once `stop` is set.
+fn search(entries: &[Entry], m: &Matcher, stop: &AtomicBool) -> Vec<Hit> {
     let hit = |(i, e): (usize, &Entry)| {
         let r = m.ranges(&e.value);
         (!r.is_empty() || m.hit(&e.key) || m.hit(&e.name)).then(|| Hit { i, n: r.len(), snippet: snippet(&e.value, r.first()) })
     };
-    entries.iter().enumerate().filter_map(hit).collect()
+    entries.iter().enumerate().take_while(|_| !stop.load(Ordering::Relaxed)).filter_map(hit).collect()
+}
+
+/// What `hits` was computed for: (query, regex, case, load generation).
+type Key = (String, bool, bool, usize);
+
+/// A search of the entries for one query, running on a thread so typing never waits for it. Dropped
+/// (and so stopped) when the query changes.
+struct Scan {
+    key: Key,
+    stop: Arc<AtomicBool>,
+    hits: Pending<Vec<Hit>>,
+}
+
+impl Scan {
+    fn start(ctx: &egui::Context, key: Key, entries: Arc<Vec<Entry>>, m: Matcher) -> Scan {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let hits = Pending::spawn(ctx, async move { tokio::task::spawn_blocking(move || search(&entries, &m, &flag)).await.unwrap_or_default() });
+        Scan { key, stop, hits }
+    }
+}
+
+impl Drop for Scan {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The line holding `at` (or the first line), cut to ~200 chars around it.
@@ -114,12 +142,14 @@ pub struct ContentSearch {
     show_secrets: bool,
     /// Ctrl+F / Ctrl+K: focus the query box next frame.
     pub focus: bool,
-    entries: Vec<Entry>,
+    entries: Arc<Vec<Entry>>,
+    /// Config Maps and Secrets the entries come from.
+    objects: usize,
     errors: Vec<String>,
     load: Option<Pending<(Vec<Entry>, Vec<String>)>>,
     hits: Vec<Hit>,
-    /// What `hits` was computed for: (query, regex, case, load generation).
-    key: Option<(String, bool, bool, usize)>,
+    key: Option<Key>,
+    scan: Option<Scan>,
     rev: usize,
     sel: Option<usize>,
 }
@@ -128,7 +158,7 @@ impl ContentSearch {
     pub fn new(ctx: &egui::Context, client: Client, ns: Vec<String>) -> Self {
         let mut find = Find::default();
         find.open = true;
-        let mut s = ContentSearch { client, ns, find, show_secrets: false, focus: true, entries: vec![], errors: vec![], load: None, hits: vec![], key: None, rev: 0, sel: None };
+        let mut s = ContentSearch { client, ns, find, show_secrets: false, focus: true, entries: Arc::default(), objects: 0, errors: vec![], load: None, hits: vec![], key: None, scan: None, rev: 0, sel: None };
         s.reload(ctx, None);
         s
     }
@@ -143,7 +173,8 @@ impl ContentSearch {
 
     pub fn ui(&mut self, ui: &mut Ui) -> Option<Picked> {
         if let Some((e, err)) = take(&mut self.load) {
-            (self.entries, self.errors, self.sel) = (e, err, None);
+            self.objects = e.iter().map(|e| (&e.ns, &e.name, e.secret)).collect::<std::collections::HashSet<_>>().len();
+            (self.entries, self.errors, self.sel) = (Arc::new(e), err, None);
             self.rev += 1;
         }
         ui.horizontal_wrapped(|ui| {
@@ -158,21 +189,25 @@ impl ContentSearch {
                 self.reload(ui.ctx(), None);
             }
             if self.load.is_some() {
-                ui.spinner();
+                crate::ui_kit::spinner(ui);
             }
         });
 
         let matcher = self.find.matcher();
         let key = (self.find.query.clone(), self.find.regex, self.find.case, self.rev);
-        if self.key.as_ref() != Some(&key) {
-            self.hits = matcher.as_ref().map(|m| search(&self.entries, m)).unwrap_or_default();
-            self.key = Some(key);
-            self.sel = None;
+        if self.key.as_ref() != Some(&key) && self.scan.as_ref().is_none_or(|s| s.key != key) {
+            match &matcher {
+                Some(m) => self.scan = Some(Scan::start(ui.ctx(), key, self.entries.clone(), m.clone())),
+                None => (self.scan, self.hits, self.key, self.sel) = (None, vec![], Some(key), None), // no query, or an invalid regex
+            }
         }
-        let objects = self.entries.iter().map(|e| (&e.ns, &e.name, e.secret)).collect::<std::collections::HashSet<_>>().len();
+        if let Some((hits, key)) = self.scan.as_mut().and_then(|s| s.hits.poll().map(|h| (h, s.key.clone()))) {
+            (self.scan, self.hits, self.key, self.sel) = (None, hits, Some(key), None);
+        }
         let status = match (&matcher, self.find.query.is_empty()) {
-            (_, true) => format!("{} keys in {objects} Config Maps and Secrets", self.entries.len()),
+            (_, true) => format!("{} keys in {} Config Maps and Secrets", self.entries.len(), self.objects),
             (None, false) => String::new(), // invalid regex, shown below
+            (Some(_), false) if self.scan.is_some() => format!("searching {} keys…", self.entries.len()),
             (Some(_), false) => format!("{} matching keys · {} keys searched", self.hits.len(), self.entries.len()),
         };
         ui.horizontal_wrapped(|ui| {
@@ -262,11 +297,46 @@ mod tests {
     #[test]
     fn finds_values_keys_and_names() {
         let es = [e(false, "app", "config.yaml", "db:\n  host: pg.local\n  port: 5432"), e(true, "db-creds", "password", "hunter2"), e(false, "other", "x", "nothing")];
+        let go = AtomicBool::new(false);
+        let search = |es: &[Entry], m: &Matcher| search(es, m, &go);
         let hits = search(&es, &Matcher::plain("PG.LOCAL", false));
         assert_eq!((hits.len(), hits[0].i, hits[0].n, hits[0].snippet.as_str()), (1, 0, 1, "  host: pg.local"));
         let by_key = search(&es, &Matcher::plain("password", false));
         assert_eq!((by_key.len(), by_key[0].i, by_key[0].n), (1, 1, 0)); // key only: no value hits
         assert_eq!(search(&es, &Matcher::regex(r"^\d{4}$|hunter\d", false).unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn a_stopped_search_leaves_the_rest_unscanned() {
+        let es: Vec<Entry> = (0..100).map(|i| e(false, "cm", "k", &format!("value {i}"))).collect();
+        let m = Matcher::plain("value", false);
+        assert_eq!(search(&es, &m, &AtomicBool::new(false)).len(), 100);
+        assert!(search(&es, &m, &AtomicBool::new(true)).is_empty());
+    }
+
+    /// The scan runs on a thread: the results arrive a frame or more later, for the latest query only.
+    #[tokio::test]
+    async fn the_page_shows_hits_when_the_scan_is_done() {
+        let mut h = crate::testkit::Harness::new(egui::vec2(900.0, 400.0));
+        let mut s = ContentSearch::new(&h.ctx, crate::testkit::dummy_client(), vec![]);
+        s.load = None;
+        s.entries = Arc::new(vec![e(false, "app", "a.yaml", "host: pg.local"), e(true, "db", "password", "hunter2"), e(false, "other", "x", "nothing")]);
+        s.find.query = "hunter".into();
+        let mut frame = |s: &mut ContentSearch| h.frame(vec![], |ui| drop(s.ui(ui)));
+        frame(&mut s);
+        assert!(s.scan.is_some(), "the scan was started, not run in the frame");
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            frame(&mut s);
+            if s.scan.is_none() {
+                break;
+            }
+        }
+        assert_eq!(s.hits.iter().map(|h| h.i).collect::<Vec<_>>(), [1]);
+        // A new query replaces the results; an invalid regex shows none.
+        (s.find.query, s.find.regex) = ("(".into(), true);
+        frame(&mut s);
+        assert!(s.scan.is_none() && s.hits.is_empty());
     }
 
     #[test]

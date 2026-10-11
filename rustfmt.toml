@@ -1,0 +1,4 @@
+# The code base uses long lines on purpose (one statement per line, chains kept together);
+# these settings keep `cargo fmt` from rewrapping all of it.
+max_width = 160
+use_small_heuristics = "Max"

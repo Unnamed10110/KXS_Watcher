@@ -1,11 +1,13 @@
 //! Find in view (Ctrl+K, Ctrl+F on logs): query state, the find bar, and highlighted text.
 use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::Arc;
 
 use egui::text::{ByteIndex, LayoutJob, LayoutSection};
+use egui::Galley;
 use egui::{Align, Color32, FontSelection, Key, RichText, Ui, WidgetText};
 
-use crate::watch::{contains_ci, RED};
+use crate::watch::RED;
 
 #[derive(Clone)]
 pub struct Matcher {
@@ -15,8 +17,11 @@ pub struct Matcher {
 }
 
 impl Matcher {
+    /// `case`: exact. Otherwise letters match in either case (ASCII ones: the search scans every line of
+    /// a log, and the regex engine does that at memory speed, with `unicode(false)` it folds no more).
     pub fn plain(needle: &str, case: bool) -> Self {
-        Matcher { re: None, needle: needle.to_string(), case }
+        let re = (!case && !needle.is_empty()).then(|| regex::RegexBuilder::new(&regex::escape(needle)).case_insensitive(true).unicode(false).build().ok()).flatten();
+        Matcher { re, needle: needle.to_string(), case }
     }
 
     /// Filter-box text, like Lens: `|` separates alternatives and `*` stands for anything, so
@@ -56,11 +61,21 @@ impl Matcher {
         }
     }
 
+    /// How many matches `ranges` would give, without building them (the scan of a whole log).
+    pub fn count(&self, hay: &str) -> usize {
+        match &self.re {
+            Some(re) => re.find_iter(hay).filter(|m| !m.is_empty()).count(),
+            None if self.case && !self.needle.is_empty() => hay.matches(&self.needle).count(),
+            None if self.case => 0,
+            None => self.ranges(hay).len(),
+        }
+    }
+
     pub fn hit(&self, hay: &str) -> bool {
         match &self.re {
             Some(re) => re.is_match(hay),
             None if self.case => hay.contains(&self.needle),
-            None => contains_ci(hay, &self.needle),
+            None => self.needle.is_empty() || hay.as_bytes().windows(self.needle.len()).any(|w| w.eq_ignore_ascii_case(self.needle.as_bytes())),
         }
     }
 }
@@ -295,8 +310,8 @@ pub fn link(ui: &mut Ui, text: impl Into<RichText>) -> egui::Response {
 
 /// True when the active find matches `text` (built only while finding); counts nothing.
 /// Used to open collapsed sections that hold matches.
-pub fn matches(text: impl FnOnce() -> String) -> bool {
-    HL.with(|h| h.borrow().as_ref().is_some_and(|h| h.m.hit(&text())))
+pub fn matches<T: AsRef<str>>(text: impl FnOnce() -> T) -> bool {
+    HL.with(|h| h.borrow().as_ref().is_some_and(|h| h.m.hit(text().as_ref())))
 }
 
 /// The text of a field being edited as one job, the active find's matches highlighted. Laid out as
@@ -354,13 +369,29 @@ pub fn masked(ui: &mut Ui, text: &str) -> egui::Response {
     .inner
 }
 
-/// Highlight a prepared job (e.g. syntax-highlighted YAML) and scroll to its current hit.
-pub fn job(ui: &mut Ui, mut job: LayoutJob) -> egui::Response {
+/// The galley of a text laid out for one width and scale, kept between frames.
+pub type Laid = Option<((f32, f32), Arc<Galley>)>;
+
+/// A prepared job (e.g. syntax-highlighted YAML) wrapped to the width available, the active find's
+/// hits highlighted and scrolled to. `laid` keeps the galley between frames: laying out a big text is
+/// what a frame costs otherwise, so it is reused while nothing matches and width and scale stay.
+pub fn job(ui: &mut Ui, job: &LayoutJob, laid: &mut Laid) -> egui::Response {
+    let key = (ui.available_width(), ui.ctx().pixels_per_point());
     let claimed = claim(&job.text);
-    if let Some((hits, cur, _)) = &claimed {
-        overlay(&mut job, hits, *cur);
-    }
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let kept = laid.as_ref().filter(|(k, _)| *k == key && claimed.is_none()).map(|(_, g)| g.clone());
+    let galley = kept.unwrap_or_else(|| {
+        let mut job = job.clone();
+        // Wrapped: certificates and last-applied annotations are single lines thousands of pixels wide.
+        job.wrap = egui::text::TextWrapping { max_width: key.0, ..Default::default() };
+        if let Some((hits, cur, _)) = &claimed {
+            overlay(&mut job, hits, *cur);
+        }
+        let g = ui.fonts_mut(|f| f.layout_job(job));
+        if claimed.is_none() {
+            *laid = Some((key, g.clone()));
+        }
+        g
+    });
     let r = ui.add(egui::Label::new(galley.clone()).selectable(true));
     if let Some((hits, Some(c), true)) = claimed {
         let ci = galley.job.text[..hits[c].start].chars().count();
@@ -384,21 +415,28 @@ mod tests {
         f.query = "(".into();
         assert!(f.matcher().is_none());
         assert!(Matcher::plain("é", false).ranges("café é").iter().all(|r| "café é".is_char_boundary(r.start)));
+        // ASCII letters fold, the rest is exact; special characters of a regex are plain text.
+        assert_eq!(Matcher::plain("É", false).ranges("é É"), vec![3..5]);
+        assert_eq!(Matcher::plain("a.b*", false).ranges("A.B* axb"), vec![0..4]);
+        let m = Matcher::plain("Pod-1", false);
+        assert!(m.hit("the POD-1 restarted") && !m.hit("pod-2"));
+        assert!(Matcher::plain("", false).ranges("abc").is_empty() && !Matcher::plain("x", true).hit("X"));
+        for (m, hay) in [(Matcher::plain("err", false), "Error: err ERR"), (Matcher::plain("err", true), "Error: err err"), (Matcher::regex(r"\d+", false).unwrap(), "1 22 abc 333"), (Matcher::plain("zz", false), "abc")] {
+            assert_eq!(m.count(hay), m.ranges(hay).len(), "{hay}");
+        }
     }
 
     /// Next/previous match inside one tall label (a secret's value): the view follows the match.
     #[test]
     fn scrolls_to_the_match_inside_a_tall_label() {
-        let ctx = egui::Context::default();
-        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
-        let text: String = (0..100).map(|i| format!("line {i}
-")).collect();
+        let mut h = crate::testkit::Harness::new(egui::vec2(400.0, 120.0));
+        h.ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let mut f = Find { open: true, query: "line 90".into(), ..Default::default() };
         let mut offset = 0.0;
         for pass in 0..4 {
             f.scroll = pass == 1; // the frame after "next" was pressed
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 120.0))), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            h.frame(vec![], |ui| {
                 begin(&mut f);
                 let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| wrapped(ui, RichText::new(&text).monospace()));
                 offset = out.state.offset.y;
@@ -408,6 +446,35 @@ mod tests {
         // The label is ~1500 px tall; centring the label itself would stop near its middle.
         assert!(offset > 1100.0, "line 90 is near the end: offset {offset}");
         assert_eq!(f.total, 1);
+    }
+
+    /// A big text laid out once: the galley is kept between frames while nothing matches (or the width
+    /// changes), and the active find's hits still show over it.
+    #[test]
+    fn a_job_is_laid_out_once() {
+        let mut h = crate::testkit::Harness::new(egui::vec2(400.0, 300.0));
+        let text = LayoutJob::simple("alpha beta
+gamma".into(), egui::FontId::monospace(12.0), Color32::WHITE, f32::INFINITY);
+        let (mut laid, mut f) = (None, Find::default());
+        let frame = |h: &mut crate::testkit::Harness, f: &mut Find, laid: &mut Laid| {
+            h.frame(vec![], |ui| {
+                begin(f);
+                job(ui, &text, laid);
+                end(f);
+            });
+        };
+        frame(&mut h, &mut f, &mut laid);
+        let first = laid.as_ref().map(|(_, g)| g.clone()).expect("kept");
+        frame(&mut h, &mut f, &mut laid);
+        assert!(Arc::ptr_eq(&first, &laid.as_ref().unwrap().1), "same galley, not laid out again");
+        // Hits: the text is laid out with its highlights; the plain galley stays for later.
+        (f.open, f.query) = (true, "beta".into());
+        frame(&mut h, &mut f, &mut laid);
+        assert_eq!(f.total, 1);
+        assert!(Arc::ptr_eq(&first, &laid.as_ref().unwrap().1));
+        (f.open, f.query) = (false, String::new());
+        frame(&mut h, &mut f, &mut laid);
+        assert!(Arc::ptr_eq(&first, &laid.as_ref().unwrap().1));
     }
 
     /// Editing a secret's value: the field highlights, counts and scrolls to the find's matches.
@@ -420,16 +487,14 @@ mod tests {
         assert!(job.keep_trailing_whitespace);
         assert!(edit_job("plain", egui::FontId::monospace(12.0), Color32::WHITE, None, None, None).sections.iter().all(|s| s.format.background == Color32::TRANSPARENT));
 
-        let ctx = egui::Context::default();
-        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
-        let mut text: String = (0..100).map(|i| format!("line {i}
-")).collect();
+        let mut h = crate::testkit::Harness::new(egui::vec2(400.0, 120.0));
+        h.ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let mut f = Find { open: true, query: "line 90".into(), ..Default::default() };
         let mut offset = 0.0;
         for pass in 0..4 {
             f.scroll = pass == 1;
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 120.0))), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            h.frame(vec![], |ui| {
                 begin(&mut f);
                 let out = egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| edit(ui, &mut text, true, egui::TextStyle::Monospace, |t| t.code_editor().desired_rows(3)));
                 offset = out.state.offset.y;
@@ -442,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one range is the case
     fn overlay_splits_sections() {
         let mut job = LayoutJob::simple("hello world".into(), egui::FontId::monospace(12.0), Color32::WHITE, f32::INFINITY);
         overlay(&mut job, &[6..11], Some(0));

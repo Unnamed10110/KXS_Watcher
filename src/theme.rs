@@ -342,6 +342,38 @@ pub fn tiles(ui: &mut Ui, cur: &mut Theme) -> bool {
     changed
 }
 
+// ---------------------------------------------------------------- status colors
+
+pub const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
+pub const ORANGE: Color32 = Color32::from_rgb(210, 153, 34);
+pub const RED: Color32 = Color32::from_rgb(218, 54, 51);
+
+/// Status coloring for status-like columns.
+pub fn cell_color(col: &str, text: &str) -> Option<Color32> {
+    if !matches!(col, "Status" | "Phase" | "Type" | "Ready" | "Reason" | "Condition") {
+        return None;
+    }
+    if let Some((a, b)) = text.split_once('/') {
+        return match (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+            (Ok(a), Ok(b)) if a < b => Some(ORANGE),
+            _ => None,
+        };
+    }
+    const RED_WORDS: &[&str] = &["NotReady", "Failed", "Error", "BackOff", "ErrImage", "OOMKilled", "Evicted", "Lost", "Invalid", "Unknown", "False", "Unhealthy"];
+    const ORANGE_WORDS: &[&str] = &["Not ready", "SchedulingDisabled", "Pending", "Creating", "Initializing", "Init:", "Terminating", "Released", "Warning", "Progressing", "Suspended"];
+    const GREEN_WORDS: &[&str] = &["Running", "Active", "Bound", "Available", "Succeeded", "Completed", "Complete", "Ready", "True", "deployed", "Healthy"];
+    let has = |ws: &[&str]| ws.iter().any(|w| text.contains(w));
+    if has(RED_WORDS) {
+        Some(RED)
+    } else if has(ORANGE_WORDS) {
+        Some(ORANGE)
+    } else if has(GREEN_WORDS) {
+        Some(GREEN)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

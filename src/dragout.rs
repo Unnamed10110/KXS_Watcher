@@ -177,9 +177,9 @@ mod tests {
         let source: IDropSource = windows::core::Interface::cast(&data).unwrap();
         // SAFETY: in-process calls on an object made here.
         unsafe {
-            assert_eq!(source.QueryContinueDrag(true.into(), MK_LBUTTON), DRAGDROP_S_CANCEL);
-            assert_eq!(source.QueryContinueDrag(false.into(), MODIFIERKEYS_FLAGS(0)), DRAGDROP_S_DROP);
-            assert_eq!(source.QueryContinueDrag(false.into(), MK_LBUTTON), S_OK);
+            assert_eq!(source.QueryContinueDrag(true, MK_LBUTTON), DRAGDROP_S_CANCEL);
+            assert_eq!(source.QueryContinueDrag(false, MODIFIERKEYS_FLAGS(0)), DRAGDROP_S_DROP);
+            assert_eq!(source.QueryContinueDrag(false, MK_LBUTTON), S_OK);
         }
     }
 
@@ -188,23 +188,21 @@ mod tests {
     #[test]
     #[allow(unused_assignments)] // `st` is refreshed after every frame, read after some
     fn selections_of_labels_and_text_fields_drag_out() {
-        use egui::{Event, PointerButton, Pos2, RawInput, Rect, vec2};
-        let ctx = egui::Context::default();
+        use crate::testkit::{button as btn, moved, Harness};
+        use egui::{Event, Pos2, Rect, vec2};
+        let mut h = Harness::new(vec2(600.0, 300.0));
+        let ctx = h.ctx.clone();
         let mut field = String::from("one two three four five six");
-        let mut k = 0.0;
         // One pass: the label's and the field's rects, and the field's selection.
         let mut frame = |events: Vec<Event>, field: &mut String| {
             let (mut label_rect, mut field_rect, mut field_cursor) = (Rect::ZERO, Rect::ZERO, None);
-            k += 1.0;
-            let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 300.0))), events, time: Some(k * 0.05), ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            h.frame(events, |ui| {
                 label_rect = ui.label("alpha beta gamma delta epsilon").rect;
                 let out = egui::TextEdit::singleline(field).desired_width(300.0).show(ui);
                 (field_rect, field_cursor) = (out.response.rect, out.cursor_range);
             });
             (label_rect, field_rect, field_cursor)
         };
-        let btn = |p: Pos2, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Default::default() };
         let label_text = |ctx: &egui::Context| ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().selected_text();
         let mut st = frame(vec![], &mut field);
         st = frame(vec![], &mut field);
@@ -212,28 +210,28 @@ mod tests {
         // --- a label
         let y = st.0.center().y;
         let (a, b) = (Pos2::new(st.0.left() + 1.0, y), Pos2::new(st.0.left() + 80.0, y));
-        for events in [vec![Event::PointerMoved(a)], vec![Event::PointerMoved(a)], vec![btn(a, true)]] {
+        for events in [vec![moved(a)], vec![moved(a)], vec![btn(a, true)]] {
             st = frame(events, &mut field);
         }
         for i in 1..=8 {
-            st = frame(vec![Event::PointerMoved(a + (b - a) * (i as f32 / 8.0))], &mut field);
+            st = frame(vec![moved(a + (b - a) * (i as f32 / 8.0))], &mut field);
         }
         st = frame(vec![btn(b, false)], &mut field);
         st = frame(vec![], &mut field);
         let picked = label_text(&ctx);
         assert!(picked.len() > 4 && "alpha beta gamma delta epsilon".contains(&picked), "{picked:?}");
         let inside = Pos2::new(st.0.left() + 30.0, y);
-        st = frame(vec![Event::PointerMoved(inside)], &mut field);
+        st = frame(vec![moved(inside)], &mut field);
         st = frame(vec![btn(inside, true)], &mut field);
         assert!(ctx.kxs_take_drag_out().is_none() && label_text(&ctx) == picked, "a press keeps the selection: {:?} vs {picked:?}", label_text(&ctx));
         for i in 1..=4 {
-            st = frame(vec![Event::PointerMoved(inside + vec2(5.0 * i as f32, 8.0 * i as f32))], &mut field);
+            st = frame(vec![moved(inside + vec2(5.0 * i as f32, 8.0 * i as f32))], &mut field);
         }
         assert_eq!(ctx.kxs_take_drag_out(), Some(picked.clone()));
         assert_eq!(label_text(&ctx), picked, "the drag does not change the selection");
         st = frame(vec![btn(inside + vec2(20.0, 32.0), false)], &mut field);
         // A click without moving collapses it.
-        for events in [vec![Event::PointerMoved(inside)], vec![btn(inside, true)], vec![btn(inside, false)], vec![]] {
+        for events in [vec![moved(inside)], vec![btn(inside, true)], vec![btn(inside, false)], vec![]] {
             st = frame(events, &mut field);
         }
         assert!(label_text(&ctx).is_empty(), "{:?}", label_text(&ctx));
@@ -242,14 +240,14 @@ mod tests {
         // --- a text field
         let y = st.1.center().y;
         let (a, b) = (Pos2::new(st.1.left() + 6.0, y), Pos2::new(st.1.left() + 60.0, y));
-        for events in [vec![Event::PointerMoved(a)], vec![btn(a, true)], vec![btn(a, false)]] {
+        for events in [vec![moved(a)], vec![btn(a, true)], vec![btn(a, false)]] {
             st = frame(events, &mut field); // focus it
         }
-        for events in [vec![Event::PointerMoved(a)], vec![btn(a, true)]] {
+        for events in [vec![moved(a)], vec![btn(a, true)]] {
             st = frame(events, &mut field);
         }
         for i in 1..=8 {
-            st = frame(vec![Event::PointerMoved(a + (b - a) * (i as f32 / 8.0))], &mut field);
+            st = frame(vec![moved(a + (b - a) * (i as f32 / 8.0))], &mut field);
         }
         st = frame(vec![btn(b, false)], &mut field);
         st = frame(vec![], &mut field);
@@ -257,16 +255,16 @@ mod tests {
         let picked = range.slice_str(&field).to_owned();
         assert!(picked.len() > 3, "{picked:?}");
         let inside = Pos2::new(st.1.left() + 30.0, y);
-        st = frame(vec![Event::PointerMoved(inside)], &mut field);
+        st = frame(vec![moved(inside)], &mut field);
         st = frame(vec![btn(inside, true)], &mut field);
         assert!(ctx.kxs_take_drag_out().is_none());
         assert_eq!(st.2.map(|r| r.slice_str(&field).to_owned()), Some(picked.clone()), "a press keeps the selection");
         for i in 1..=4 {
-            st = frame(vec![Event::PointerMoved(inside + vec2(5.0 * i as f32, 8.0 * i as f32))], &mut field);
+            st = frame(vec![moved(inside + vec2(5.0 * i as f32, 8.0 * i as f32))], &mut field);
         }
         assert_eq!(ctx.kxs_take_drag_out(), Some(picked.clone()));
         st = frame(vec![btn(inside + vec2(20.0, 32.0), false)], &mut field);
-        for events in [vec![Event::PointerMoved(inside)], vec![btn(inside, true)], vec![btn(inside, false)], vec![]] {
+        for events in [vec![moved(inside)], vec![btn(inside, true)], vec![btn(inside, false)], vec![]] {
             st = frame(events, &mut field);
         }
         assert!(st.2.is_some_and(|r| r.is_empty()), "a click collapses it: {:?}", st.2);

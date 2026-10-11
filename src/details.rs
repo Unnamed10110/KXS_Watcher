@@ -2,9 +2,11 @@
 //! to the objects it references, related objects, events, an editor for Secret/ConfigMap data,
 //! and the actions that apply to it.
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use base64::Engine;
-use egui::{Color32, RichText, Ui};
+use egui::text::LayoutJob;
+use egui::{Color32, RichText, TextStyle, Ui};
 use kube::Client;
 use serde_json::{json, Value};
 
@@ -40,6 +42,70 @@ pub enum Act {
     Suspend(bool),
     /// kubectl port-forward target (`pod/x`, `svc/x`) and remote port
     Forward(String, u16),
+    /// Put a kubectl command for the object on the clipboard.
+    Kubectl(Kubectl),
+}
+
+/// A read-only kubectl command to copy, aimed at this cluster and object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kubectl {
+    Get,
+    Describe,
+    Logs,
+    Exec,
+}
+
+impl Kubectl {
+    /// The commands that fit a kind.
+    pub fn for_kind(kind: &Kind) -> Vec<Kubectl> {
+        let mut v = vec![Kubectl::Get, Kubectl::Describe];
+        if has_logs(kind) {
+            v.push(Kubectl::Logs);
+        }
+        if is(kind, "", &["Pod"]) {
+            v.push(Kubectl::Exec);
+        }
+        v
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kubectl::Get => "kubectl get -o yaml",
+            Kubectl::Describe => "kubectl describe",
+            Kubectl::Logs => "kubectl logs -f",
+            Kubectl::Exec => "kubectl exec -it … sh",
+        }
+    }
+
+    /// The command line for `t` in the cluster of `k` (the kubeconfig file and the context named, so it
+    /// runs the same from any shell).
+    pub fn line(self, k: &crate::kubeconfig::Ctx, t: &Target) -> String {
+        let ar = &t.kind.ar;
+        // `plural.group` names a kind unambiguously (`deployments.apps`, `certificates.cert-manager.io`).
+        let resource = if ar.group.is_empty() { ar.plural.clone() } else { format!("{}.{}", ar.plural, ar.group) };
+        let ns = if t.ns.is_empty() { String::new() } else { format!(" -n {}", t.ns) };
+        let rest = match self {
+            Kubectl::Get => format!("get {resource} {}{ns} -o yaml", t.name),
+            Kubectl::Describe => format!("describe {resource} {}{ns}", t.name),
+            Kubectl::Logs => format!("logs -f {}/{}{ns} --all-containers --timestamps", ar.kind.to_lowercase(), t.name),
+            Kubectl::Exec => format!("exec -it {}{ns} -- sh", t.name),
+        };
+        crate::tabs::kubectl_line(k, &rest)
+    }
+}
+
+/// "Copy as kubectl ▸" in a menu: the command picked, if any.
+pub fn kubectl_menu(ui: &mut Ui, kind: &Kind) -> Option<Kubectl> {
+    let mut picked = None;
+    ui.menu_button("⧉ Copy as kubectl", |ui| {
+        for k in Kubectl::for_kind(kind) {
+            if ui.button(k.label()).clicked() {
+                picked = Some(k);
+                ui.close();
+            }
+        }
+    });
+    picked
 }
 
 impl Act {
@@ -60,6 +126,7 @@ impl Act {
             Act::Suspend(true) => "⏸ Suspend".into(),
             Act::Suspend(false) => "▶ Resume".into(),
             Act::Forward(t, p) => format!("↔ Forward {t}:{p}"),
+            Act::Kubectl(k) => format!("⧉ {}", k.label()),
         }
     }
 
@@ -182,7 +249,8 @@ pub struct Details {
     pub section: Section,
     rv: String,
     client: Client,
-    obj: Option<Value>,
+    obj: Option<Arc<Value>>,
+    cache: Cache,
     error: Option<String>,
     load: Option<Pending<Res<Value>>>,
     events: Option<Res<Vec<Ev>>>,
@@ -196,6 +264,50 @@ pub struct Details {
     save: Option<Pending<Res>>,
     save_status: Option<Res>,
     gone: bool,
+}
+
+/// What is derived from the current version of the object: built when first needed, dropped when a
+/// newer version arrives, so a frame doesn't redo it.
+#[derive(Default)]
+struct Cache {
+    yaml: Option<Yaml>,
+    /// The values of `data` as shown, in the order of its keys.
+    data: Option<Arc<Vec<Val>>>,
+}
+
+/// The YAML of the object as the YAML section shows it.
+struct Yaml {
+    text: String,
+    /// The text colored for a theme and a font.
+    job: LayoutJob,
+    look: Option<(bool, egui::FontId)>,
+    laid: find::Laid,
+}
+
+/// A value of Secret / ConfigMap `data`: its text, or the size of what isn't UTF-8 text.
+enum Val {
+    Text(String),
+    Binary(usize),
+}
+
+impl Cache {
+    fn yaml(&mut self, obj: &Value, ui: &Ui) -> &mut Yaml {
+        let y = self.yaml.get_or_insert_with(|| Yaml { text: ops::to_yaml(obj), job: LayoutJob::default(), look: None, laid: None });
+        let look = (ui.visuals().dark_mode, TextStyle::Monospace.resolve(ui.style()));
+        if y.look.as_ref() != Some(&look) {
+            y.job = crate::yamlhl::job(&y.text, &look.1, ui.visuals().text_color(), look.0);
+            (y.look, y.laid) = (Some(look), None);
+        }
+        y
+    }
+
+    fn data(&mut self, data: &Value, secret: bool) -> Arc<Vec<Val>> {
+        let decode = |v: &Value| match decode_value(s(v), secret) {
+            Some(t) => Val::Text(t),
+            None => Val::Binary(b64_decode(s(v)).map_or(0, |b| b.len())),
+        };
+        self.data.get_or_insert_with(|| Arc::new(data.as_object().into_iter().flatten().map(|(_, v)| decode(v)).collect())).clone()
+    }
 }
 
 fn s(v: &Value) -> &str {
@@ -425,6 +537,98 @@ fn refs_section(ui: &mut Ui, acts: &mut Vec<Act>, pod_spec: &Value, ns: &str) {
     }
 }
 
+/// Where the value of an environment variable of a container comes from.
+#[derive(Debug, PartialEq)]
+enum EnvVal<'a> {
+    Literal(&'a str),
+    /// `valueFrom.configMapKeyRef` / `secretKeyRef`: the kind, the object and the key in it.
+    Key { kind: &'static str, name: &'a str, key: &'a str },
+    /// `fieldRef` / `resourceFieldRef`, as `kubectl describe` writes them.
+    Field(String),
+}
+
+/// The `env` of a container, in order: (name, where its value is).
+fn env_vars(c: &Value) -> Vec<(&str, EnvVal<'_>)> {
+    arr(&c["env"])
+        .map(|e| {
+            let from = &e["valueFrom"];
+            let val = if let Some(k) = from["secretKeyRef"].as_object() {
+                EnvVal::Key { kind: "Secret", name: k.get("name").and_then(Value::as_str).unwrap_or(""), key: k.get("key").and_then(Value::as_str).unwrap_or("") }
+            } else if let Some(k) = from["configMapKeyRef"].as_object() {
+                EnvVal::Key { kind: "ConfigMap", name: k.get("name").and_then(Value::as_str).unwrap_or(""), key: k.get("key").and_then(Value::as_str).unwrap_or("") }
+            } else if from["fieldRef"].is_object() {
+                EnvVal::Field(format!("fieldRef {}", s(&from["fieldRef"]["fieldPath"])))
+            } else if from["resourceFieldRef"].is_object() {
+                EnvVal::Field(format!("resourceFieldRef {}", s(&from["resourceFieldRef"]["resource"])))
+            } else {
+                EnvVal::Literal(s(&e["value"]))
+            };
+            (s(&e["name"]), val)
+        })
+        .collect()
+}
+
+/// The `envFrom` of a container: (kind, object, prefix of the variable names).
+fn env_from(c: &Value) -> Vec<(&'static str, &str, &str)> {
+    arr(&c["envFrom"])
+        .filter_map(|e| match (e["configMapRef"]["name"].as_str(), e["secretRef"]["name"].as_str()) {
+            (Some(n), _) => Some(("ConfigMap", n, s(&e["prefix"]))),
+            (_, Some(n)) => Some(("Secret", n, s(&e["prefix"]))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A container's environment: its variables (a value from a Secret or a ConfigMap links to the object, it
+/// is never read here) and the objects it takes whole. Open while the find has a match in it.
+fn env_ui(ui: &mut Ui, acts: &mut Vec<Act>, c: &Value, ns: &str, container: &str) {
+    let (vars, from) = (env_vars(c), env_from(c));
+    if vars.is_empty() && from.is_empty() {
+        return;
+    }
+    let shown = |v: &EnvVal| match v {
+        EnvVal::Literal(t) => (*t).to_string(),
+        EnvVal::Key { kind, name, key } => format!("{} {name} {key}", kind.to_lowercase()),
+        EnvVal::Field(f) => f.clone(),
+    };
+    let hit = find::matches(|| {
+        let mut t: String = vars.iter().map(|(n, v)| format!("{n}={}\n", shown(v))).collect();
+        t.extend(from.iter().map(|(k, n, p)| format!("{k} {n} {p}\n")));
+        t
+    });
+    egui::CollapsingHeader::new(format!("Environment ({})", vars.len() + from.len())).id_salt(("env", container)).open(hit.then_some(true)).show(ui, |ui| {
+        grid(ui, &format!("env-{container}"), |ui| {
+            for (kind, name, prefix) in &from {
+                find::label(ui, RichText::new(if prefix.is_empty() { "all keys of".to_string() } else { format!("all keys of ({prefix}…)") }).weak());
+                ui.horizontal(|ui| {
+                    find::label(ui, RichText::new(kind.to_lowercase()).weak());
+                    obj_link(ui, acts, "", kind, ns, name);
+                });
+                ui.end_row();
+            }
+            for (name, val) in &vars {
+                find::label(ui, RichText::new(*name).monospace());
+                match val {
+                    EnvVal::Literal(t) => {
+                        find::wrapped(ui, RichText::new(*t).monospace());
+                    }
+                    EnvVal::Key { kind, name, key } => {
+                        ui.horizontal(|ui| {
+                            find::label(ui, RichText::new(kind.to_lowercase()).weak());
+                            obj_link(ui, acts, "", kind, ns, name);
+                            find::label(ui, RichText::new(format!(": {key}")).monospace());
+                        });
+                    }
+                    EnvVal::Field(f) => {
+                        find::label(ui, RichText::new(f).weak());
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    });
+}
+
 impl Details {
     pub fn new(ctx: &egui::Context, client: Client, kind: Kind, ns: String, name: String) -> Self {
         let mut d = Details {
@@ -433,6 +637,7 @@ impl Details {
             rv: String::new(),
             client,
             obj: None,
+            cache: Cache::default(),
             error: None,
             load: None,
             events: None,
@@ -508,7 +713,8 @@ impl Details {
                     let uid = s(&o["metadata"]["uid"]).to_string();
                     self.ev_load = Some(Pending::spawn(ctx, ops::events_for(self.client.clone(), self.t.ns.clone(), uid)));
                     self.rel_load = Some(Pending::spawn(ctx, ops::related(self.client.clone(), self.t.kind.clone(), o.clone())));
-                    self.obj = Some(o);
+                    self.obj = Some(Arc::new(o));
+                    self.cache = Cache::default();
                     self.error = None;
                 }
                 Err(e) => self.error = Some(e),
@@ -530,6 +736,7 @@ impl Details {
 
     /// `full`: an object tab (big header, Overview / Events / YAML); else the compact details panel.
     pub fn ui(&mut self, ui: &mut Ui, metrics: &Metrics, acts: &mut Vec<Act>, find: &mut Find, full: bool) {
+        crate::prof!("Details::ui");
         self.poll(ui.ctx());
         let t = ui_kit::tokens(ui);
         let status = self.obj.as_ref().and_then(|o| status_of(&self.t.kind, o));
@@ -566,6 +773,9 @@ impl Details {
                             acts.push(a.clone());
                         }
                     }
+                    if let Some(k) = kubectl_menu(ui, &self.t.kind) {
+                        acts.push(Act::Kubectl(k));
+                    }
                 });
             });
             ui.add_space(8.0);
@@ -594,6 +804,9 @@ impl Details {
                         acts.push(a.clone());
                     }
                 }
+                if let Some(k) = kubectl_menu(ui, &self.t.kind) {
+                    acts.push(Act::Kubectl(k));
+                }
             });
             ui.add_space(2.0);
         }
@@ -613,21 +826,14 @@ impl Details {
                         ui.colored_label(RED, e);
                     }
                     (None, None) => {
-                        ui.spinner();
+                        crate::ui_kit::spinner(ui);
                     }
                     _ => {}
                 }
                 if let Some(obj) = self.obj.clone() {
-                    let yaml = |ui: &mut Ui| {
-                        let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-                        let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, &ops::to_yaml(&obj), "yaml");
-                        // Wrapped: certificates and last-applied annotations are single lines thousands of pixels wide.
-                        job.wrap = egui::text::TextWrapping { max_width: ui.available_width(), ..Default::default() };
-                        find::job(ui, job);
-                    };
                     match (full, self.section) {
                         (true, Section::Events) => self.events_ui(ui),
-                        (true, Section::Yaml) => yaml(ui),
+                        (true, Section::Yaml) => self.yaml_ui(ui, &obj),
                         (true, Section::Overview) => {
                             self.body(ui, &obj, metrics, acts);
                             self.related_ui(ui, acts);
@@ -638,8 +844,8 @@ impl Details {
                             self.events_ui(ui);
                             end_sections(ui);
                             ui.add_space(8.0);
-                            let hit = find::matches(|| ops::to_yaml(&obj));
-                            egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, yaml);
+                            let hit = find::matches(|| self.cache.yaml(&obj, ui).text.as_str());
+                            egui::CollapsingHeader::new("YAML").id_salt("yaml").open(hit.then_some(true)).show(ui, |ui| self.yaml_ui(ui, &obj));
                         }
                     }
                 }
@@ -647,6 +853,12 @@ impl Details {
             });
         });
         find::end(find);
+    }
+
+    fn yaml_ui(&mut self, ui: &mut Ui, obj: &Value) {
+        crate::prof!("details yaml");
+        let y = self.cache.yaml(obj, ui);
+        find::job(ui, &y.job, &mut y.laid);
     }
 
     fn body(&mut self, ui: &mut Ui, obj: &Value, m: &Metrics, acts: &mut Vec<Act>) {
@@ -675,7 +887,7 @@ impl Details {
         });
         for (title, field) in [("Labels", "labels"), ("Annotations", "annotations")] {
             let Some(map) = meta[field].as_object().filter(|m| !m.is_empty()) else { continue };
-            let hit = find::matches(|| map.iter().map(|(k, v)| format!("{k}={}", s(v)).chars().take(90).chain(['\n']).collect::<String>()).collect());
+            let hit = find::matches(|| map.iter().map(|(k, v)| format!("{k}={}", s(v)).chars().take(90).chain(['\n']).collect::<String>()).collect::<String>());
             egui::CollapsingHeader::new(format!("{title} ({})", map.len())).id_salt(field).default_open(field == "labels").open(hit.then_some(true)).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (k, v) in map {
@@ -886,7 +1098,7 @@ impl Details {
         section_with(ui, "Data", Some((format!("{kind}{n} key{}", if n == 1 { "" } else { "s" }), ui_kit::tokens(ui).muted)));
         ui.horizontal(|ui| {
             if self.save.is_some() {
-                ui.spinner();
+                crate::ui_kit::spinner(ui);
             }
             match &self.save_status {
                 Some(Ok(m)) => ui.colored_label(GREEN, m),
@@ -895,22 +1107,26 @@ impl Details {
             };
         });
 
-        let data = obj["data"].clone();
+        let data = &obj["data"];
+        let vals = self.cache.data(data, secret);
         let mut edit = None;
-        for (key, v) in data.as_object().into_iter().flatten() {
+        for ((key, _), val) in data.as_object().into_iter().flatten().zip(vals.iter()) {
             ui.push_id(key, |ui| {
                 if self.editing.as_ref().is_some_and(|e| e.orig.as_deref() == Some(key)) {
                     edit = self.key_editor(ui).or(edit.take());
                     return;
                 }
-                let text = decode_value(s(v), secret);
+                let text = match val {
+                    Val::Text(t) => Some(t),
+                    Val::Binary(_) => None,
+                };
                 ui.horizontal(|ui| {
                     find::label(ui, RichText::new(key).strong());
                     let shown = !secret || self.reveal.contains(key);
                     if secret && text.is_some() && ui.small_button(if shown { "Hide" } else { "👁 Show" }).clicked() {
                         if shown { self.reveal.remove(key) } else { self.reveal.insert(key.clone()) };
                     }
-                    if let Some(t) = &text {
+                    if let Some(t) = text {
                         if ui.small_button("Copy").clicked() {
                             ui.ctx().copy_text(t.clone());
                         }
@@ -935,8 +1151,8 @@ impl Details {
                         }
                     });
                 }
-                match (&text, !secret || self.reveal.contains(key)) {
-                    (None, _) => ui.label(RichText::new(format!("<binary, {} bytes>", b64_decode(s(v)).map_or(0, |b| b.len()))).weak()),
+                match (text, !secret || self.reveal.contains(key)) {
+                    (None, _) => ui.label(RichText::new(format!("<binary, {} bytes>", if let Val::Binary(n) = val { *n } else { 0 })).weak()),
                     (Some(t), true) => find::wrapped(ui, RichText::new(t).monospace()),
                     (Some(t), false) => find::masked(ui, t),
                 };
@@ -953,7 +1169,7 @@ impl Details {
             self.save_status = None;
         }
         if let Some(e) = edit {
-            match apply_edit(&data, &e, secret) {
+            match apply_edit(data, &e, secret) {
                 Ok(new_data) => {
                     let mut new = obj.clone();
                     new["data"] = new_data;
@@ -1061,10 +1277,8 @@ impl Details {
                         kv(ui, label, o.iter().map(|(k, v)| format!("{k}: {}", s(v))).collect::<Vec<_>>().join(", "));
                     }
                 }
-                if let Some(env) = c["env"].as_array() {
-                    kv(ui, "Env vars", env.len().to_string());
-                }
             });
+            env_ui(ui, acts, c, &ns, name);
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("📜 Logs").clicked() {
                     acts.push(Act::Logs(Some(name.into())));
@@ -1140,7 +1354,7 @@ impl Details {
                     egui::Grid::new(("related", kind)).num_columns(3).striped(true).spacing([12.0, 3.0]).show(ui, |ui| {
                         for r in items {
                             let color = cell_color("Status", &r.status).unwrap_or(ui.visuals().weak_text_color());
-                            watch::dot(ui, color);
+                            ui_kit::dot(ui, color, 4.0);
                             obj_link(ui, acts, &r.group, &r.kind, &r.ns, &r.name);
                             find::label(ui, RichText::new(&r.status).color(color));
                             ui.end_row();
@@ -1224,5 +1438,163 @@ mod tests {
         let g = group_events(&[ev("BackOff", 2), ev("Failed", 1), ev("BackOff", 3)]);
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].count, 5);
+    }
+
+    /// A ConfigMap or Secret of about 1 MB (40 keys of 25 KB) in a details panel, the thing the panel
+    /// redraws every frame while it is open.
+    fn big(secret: bool, keys: usize) -> (Details, Value) {
+        let text = |k: usize| (0..320).map(|i| format!("setting.{k}.{i}=value-of-the-setting-{}-{}\n", i * 7, k * 13)).collect::<String>();
+        let enc = |t: String| base64::engine::general_purpose::STANDARD.encode(t);
+        let data: serde_json::Map<String, Value> = (0..keys).map(|k| (format!("file-{k:02}.properties"), Value::String(if secret { enc(text(k)) } else { text(k) }))).collect();
+        let obj = json!({"apiVersion": "v1", "kind": if secret { "Secret" } else { "ConfigMap" }, "type": "Opaque",
+            "metadata": {"name": "big", "namespace": "default", "uid": "u1", "resourceVersion": "1", "creationTimestamp": "2026-01-01T00:00:00Z"}, "data": data});
+        let ar = if secret { kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Secret>(&()) } else { kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::ConfigMap>(&()) };
+        let kind = Kind { ar, namespaced: true, verbs: ["get", "update", "delete"].map(String::from).to_vec() };
+        let mut d = Details::new(&egui::Context::default(), crate::testkit::dummy_client(), kind, "default".into(), "big".into());
+        d.load = None;
+        (d, obj)
+    }
+
+    #[test]
+    fn kubectl_commands_name_the_cluster_and_the_object() {
+        let ctx = crate::kubeconfig::Ctx { file: "C:\\kube\\qa.yaml".into(), name: "k8s-qa".into(), server: String::new(), namespace: None };
+        let kind = |g: &str, k: &str, plural: &str| Kind { ar: kube::api::ApiResource { group: g.into(), version: "v1".into(), api_version: String::new(), kind: k.into(), plural: plural.into() }, namespaced: true, verbs: vec![] };
+        let t = |kind: Kind, ns: &str| Target { kind, ns: ns.into(), name: "web".into() };
+        let pod = t(kind("", "Pod", "pods"), "argocd");
+        assert_eq!(Kubectl::Get.line(&ctx, &pod), r#"kubectl --kubeconfig "C:\kube\qa.yaml" --context "k8s-qa" get pods web -n argocd -o yaml"#);
+        assert!(Kubectl::Describe.line(&ctx, &pod).ends_with("describe pods web -n argocd"));
+        assert!(Kubectl::Exec.line(&ctx, &pod).ends_with("exec -it web -n argocd -- sh"));
+        let deploy = t(kind("apps", "Deployment", "deployments"), "argocd");
+        assert!(Kubectl::Logs.line(&ctx, &deploy).ends_with("logs -f deployment/web -n argocd --all-containers --timestamps"));
+        assert!(Kubectl::Get.line(&ctx, &deploy).contains("get deployments.apps web "));
+        let node = t(kind("", "Node", "nodes"), "");
+        assert!(Kubectl::Get.line(&ctx, &node).ends_with("get nodes web -o yaml"), "a cluster-wide object has no namespace");
+        assert_eq!(Kubectl::for_kind(&pod.kind), [Kubectl::Get, Kubectl::Describe, Kubectl::Logs, Kubectl::Exec]);
+        assert_eq!(Kubectl::for_kind(&node.kind), [Kubectl::Get, Kubectl::Describe]);
+    }
+
+    #[test]
+    fn a_containers_environment_says_where_each_value_comes_from() {
+        let c = json!({"name": "app", "env": [
+            {"name": "LOG_LEVEL", "value": "debug"},
+            {"name": "DB_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "db", "key": "password"}}},
+            {"name": "FEATURES", "valueFrom": {"configMapKeyRef": {"name": "flags", "key": "list"}}},
+            {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
+            {"name": "CPU", "valueFrom": {"resourceFieldRef": {"resource": "limits.cpu"}}},
+            {"name": "EMPTY"}],
+            "envFrom": [{"configMapRef": {"name": "shared"}}, {"secretRef": {"name": "creds"}, "prefix": "DB_"}, {}]});
+        let vars = env_vars(&c);
+        assert_eq!(vars.len(), 6);
+        assert_eq!(vars[0], ("LOG_LEVEL", EnvVal::Literal("debug")));
+        assert_eq!(vars[1], ("DB_PASSWORD", EnvVal::Key { kind: "Secret", name: "db", key: "password" }));
+        assert_eq!(vars[2], ("FEATURES", EnvVal::Key { kind: "ConfigMap", name: "flags", key: "list" }));
+        assert_eq!(vars[3], ("POD_IP", EnvVal::Field("fieldRef status.podIP".into())));
+        assert_eq!(vars[4], ("CPU", EnvVal::Field("resourceFieldRef limits.cpu".into())));
+        assert_eq!(vars[5], ("EMPTY", EnvVal::Literal("")));
+        assert_eq!(env_from(&c), [("ConfigMap", "shared", ""), ("Secret", "creds", "DB_")]);
+        assert!(env_vars(&json!({"name": "x"})).is_empty() && env_from(&json!({"name": "x"})).is_empty());
+    }
+
+    /// The environment is a collapsed section of the container; a find with a match in it opens it, and
+    /// counts the match.
+    #[tokio::test]
+    async fn find_opens_the_environment_that_has_the_match() {
+        let mut h = crate::testkit::Harness::themed(egui::vec2(520.0, 900.0));
+        let (m, mut find) = (Metrics::default(), Find::default());
+        let kind = Kind { ar: kube::api::ApiResource::erase::<k8s_openapi::api::core::v1::Pod>(&()), namespaced: true, verbs: vec![] };
+        let mut d = Details::new(&egui::Context::default(), crate::testkit::dummy_client(), kind, "default".into(), "web".into());
+        d.load = None;
+        d.obj = Some(Arc::new(json!({"kind": "Pod", "metadata": {"name": "web", "namespace": "default", "uid": "u"}, "spec": {"containers": [
+            {"name": "app", "image": "x:1", "env": [{"name": "UPSTREAM_HOST", "value": "pg.internal"}]}]}, "status": {"phase": "Running"}})));
+        let mut frame = |d: &mut Details, find: &mut Find| h.frame(vec![], |ui| d.ui(ui, &m, &mut vec![], find, false));
+        frame(&mut d, &mut find);
+        assert_eq!(find.total, 0);
+        (find.open, find.query) = (true, "pg.internal".into());
+        frame(&mut d, &mut find);
+        frame(&mut d, &mut find);
+        assert_eq!(find.total, 2, "the value in the (now open) environment, and again in the YAML below");
+    }
+
+    #[test]
+    fn data_is_decoded_once_per_version() {
+        let data = json!({"admin": "YWRtaW4=", "bin": "/w=="});
+        let mut c = Cache::default();
+        let vals = c.data(&data, true);
+        assert!(matches!(&vals[..], [Val::Text(t), Val::Binary(1)] if t == "admin"));
+        assert!(Arc::ptr_eq(&vals, &c.data(&json!({}), true)), "kept until a newer version drops the cache");
+        assert!(matches!(&Cache::default().data(&json!({"a": "YWRtaW4="}), false)[..], [Val::Text(t)] if t == "YWRtaW4="), "a ConfigMap's values are shown as they are");
+    }
+
+    #[tokio::test]
+    async fn the_yaml_is_built_once_and_replaced_by_the_next_version() {
+        let mut h = crate::testkit::Harness::themed(egui::vec2(520.0, 600.0));
+        let (m, mut find) = (Metrics::default(), Find::default());
+        let (mut d, obj) = big(false, 1);
+        d.obj = Some(obj.into());
+        d.section = Section::Yaml;
+        let mut frame = |d: &mut Details| h.frame(vec![], |ui| d.ui(ui, &m, &mut vec![], &mut find, true));
+        frame(&mut d);
+        let y = d.cache.yaml.as_ref().expect("built when the YAML section is drawn");
+        assert!(y.text.contains("file-00.properties") && !y.text.contains("managedFields"));
+        let (text, galley) = (y.text.as_ptr(), y.laid.as_ref().map(|(_, g)| g.clone()).expect("laid out"));
+        frame(&mut d);
+        let y = d.cache.yaml.as_ref().unwrap();
+        assert_eq!(y.text.as_ptr(), text, "the same text, not rendered again");
+        assert!(Arc::ptr_eq(&galley, &y.laid.as_ref().unwrap().1));
+        // A newer version arrives: what was derived from the old one is gone.
+        d.load = Some(Pending::spawn(&egui::Context::default(), async { Ok(json!({"metadata": {"name": "big", "uid": "u2"}, "data": {"fresh": "1"}})) }));
+        for _ in 0..200 {
+            if d.load.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            frame(&mut d);
+        }
+        assert!(d.cache.yaml.as_ref().is_some_and(|y| y.text.contains("fresh") && !y.text.contains("file-00")));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn bench_details_frame_1mb() {
+        let mut h = crate::testkit::Harness::themed(egui::vec2(520.0, 900.0));
+        let (m, mut find) = (Metrics::default(), Find::default());
+        for secret in [false, true] {
+            let (mut d, obj) = big(secret, 1);
+            d.obj = Some(obj.into());
+            let kind = if secret { "Secret" } else { "ConfigMap" };
+            let mut frame = |d: &mut Details, find: &mut Find, full: bool| h.frame(vec![], |ui| d.ui(ui, &m, &mut vec![], find, full));
+            frame(&mut d, &mut find, false);
+            crate::prof::bench(&format!("details frame, 14 KB {kind}, panel"), 50, || frame(&mut d, &mut find, false));
+            let (mut d, obj) = big(secret, 40);
+            d.obj = Some(obj.into());
+            let kind = if secret { "Secret" } else { "ConfigMap" };
+            let mut frame = |d: &mut Details, find: &mut Find, full: bool| h.frame(vec![], |ui| d.ui(ui, &m, &mut vec![], find, full));
+            frame(&mut d, &mut find, false);
+            frame(&mut d, &mut find, false);
+            crate::prof::bench(&format!("details frame, 1 MB {kind}, panel"), 20, || frame(&mut d, &mut find, false));
+            d.section = Section::Yaml;
+            for i in 0..5 {
+                let t = std::time::Instant::now();
+                frame(&mut d, &mut find, true);
+                eprintln!("  yaml tab frame {i}: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0);
+            }
+            crate::prof::bench(&format!("details frame, 1 MB {kind}, YAML tab"), 10, || frame(&mut d, &mut find, true));
+            (find.open, find.query) = (true, "needle".into());
+            crate::prof::bench(&format!("details frame, 1 MB {kind}, panel + find"), 10, || frame(&mut d, &mut find, false));
+            (find.open, find.query) = (false, String::new());
+        }
+        // Building the YAML section of a new version of the object: the text, then its colors (the
+        // first run also loads the syntax definitions).
+        for keys in [1, 2, 5, 10] {
+            let (_, obj) = big(false, keys);
+            let t = std::time::Instant::now();
+            let text = ops::to_yaml(&obj);
+            let to_yaml = t.elapsed();
+            let t = std::time::Instant::now();
+            h.frame(vec![], |ui| {
+                Cache::default().yaml(&obj, ui);
+            });
+            eprintln!("bench details YAML build, {:>4} KB: to_yaml {:>7.3} ms, with colors {:>9.3} ms", text.len() / 1024, to_yaml.as_secs_f64() * 1000.0, t.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 }

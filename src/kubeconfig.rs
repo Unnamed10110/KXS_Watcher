@@ -1,6 +1,11 @@
 //! Context discovery across every kubeconfig we can find, and client construction.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::tasks::Lock;
 
 use kube::config::{KubeConfigOptions, Kubeconfig};
 
@@ -53,6 +58,7 @@ pub fn candidate_files(kubeconfig_env: Option<&std::ffi::OsStr>, extra: &[PathBu
 
 /// Every candidate file with its modification time: differs once one is edited, added or removed.
 pub fn stamp(extra: &[PathBuf]) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    crate::prof!("kubeconfig::stamp");
     candidate_files(std::env::var_os("KUBECONFIG").as_deref(), extra)
         .into_iter()
         .map(|f| {
@@ -60,6 +66,55 @@ pub fn stamp(extra: &[PathBuf]) -> Vec<(PathBuf, Option<std::time::SystemTime>)>
             (f, modified)
         })
         .collect()
+}
+
+/// Notices kubeconfig files edited, added or removed. A task looks at their modification times every
+/// few seconds: the UI never waits for the disk, and nothing wakes it unless something changed.
+pub struct Watch {
+    paths: Arc<Mutex<Vec<PathBuf>>>,
+    changed: Arc<AtomicBool>,
+    _task: crate::tasks::Bg,
+}
+
+impl Watch {
+    pub fn new(ctx: &egui::Context, paths: &[PathBuf]) -> Watch {
+        Watch::every(ctx, paths, Duration::from_secs(3))
+    }
+
+    fn every(ctx: &egui::Context, paths: &[PathBuf], every: Duration) -> Watch {
+        let (shared, changed) = (Arc::new(Mutex::new(paths.to_vec())), Arc::new(AtomicBool::new(false)));
+        let (p, c, ctx) = (shared.clone(), changed.clone(), ctx.clone());
+        let task = crate::tasks::Bg::spawn(async move {
+            let look = || {
+                let paths = p.locked().clone();
+                async move { tokio::task::spawn_blocking(move || stamp(&paths)).await.unwrap_or_default() }
+            };
+            let mut last = look().await;
+            loop {
+                tokio::time::sleep(every).await;
+                let now = look().await;
+                if now != last {
+                    last = now;
+                    c.store(true, Ordering::Relaxed);
+                    crate::repaint::now(&ctx);
+                }
+            }
+        });
+        Watch { paths: shared, changed, _task: task }
+    }
+
+    /// The folders and files the user asked to look in.
+    pub fn set_paths(&self, paths: &[PathBuf]) {
+        let mut p = self.paths.locked();
+        if p.as_slice() != paths {
+            *p = paths.to_vec();
+        }
+    }
+
+    /// True once after something changed.
+    pub fn changed(&self) -> bool {
+        self.changed.swap(false, Ordering::Relaxed)
+    }
 }
 
 pub fn discover(extra: &[PathBuf]) -> Vec<Ctx> {
@@ -138,7 +193,7 @@ users:
         std::fs::write(dir.join("config-qa"), KC).unwrap();
         std::fs::write(dir.join("junk.bin"), [0u8, 159, 146, 150]).unwrap();
 
-        let files = candidate_files(None, &[dir.clone()]);
+        let files = candidate_files(None, std::slice::from_ref(&dir));
         assert!(files.iter().any(|f| f.ends_with("config-qa")));
         assert!(!files.iter().any(|f| f.ends_with("cache")));
 
@@ -164,6 +219,28 @@ users:
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn a_new_kubeconfig_is_noticed_by_the_background_task() {
+        let dir = std::env::temp_dir().join(format!("kxs-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = Watch::every(&egui::Context::default(), std::slice::from_ref(&dir), Duration::from_millis(15));
+        tokio::time::sleep(Duration::from_millis(250)).await; // the first look is the one to compare with
+        assert!(!w.changed(), "nothing happened yet");
+        std::fs::write(dir.join("new-cluster"), KC).unwrap();
+        let mut seen = false;
+        for _ in 0..300 {
+            seen |= w.changed();
+            if seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "the new file was noticed");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!w.changed(), "and reported once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn splits_kubeconfig_env_and_dedupes() {
         let joined = std::env::join_paths(["a.yaml", "b.yaml", "a.yaml"]).unwrap();
@@ -171,5 +248,17 @@ users:
         assert_eq!(files[0], PathBuf::from("a.yaml"));
         assert_eq!(files[1], PathBuf::from("b.yaml"));
         assert_eq!(files.iter().filter(|f| f.ends_with("a.yaml")).count(), 1);
+    }
+
+    #[test]
+    fn a_terminal_is_pinned_to_its_context() {
+        let ctx = Ctx { file: std::env::temp_dir().join("kxs-pin-test-config"), name: "qa \"east\"".into(), server: String::new(), namespace: None };
+        let value = terminal_kubeconfig(&ctx).unwrap();
+        let paths: Vec<_> = std::env::split_paths(&value).collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[1], ctx.file, "the real file comes second: its credentials, not its current-context");
+        let pin = std::fs::read_to_string(&paths[0]).unwrap();
+        std::fs::remove_file(&paths[0]).ok();
+        assert!(pin.contains(r#"current-context: "qa \"east\"""#), "the name is quoted and escaped: {pin}");
     }
 }

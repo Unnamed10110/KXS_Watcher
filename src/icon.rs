@@ -116,7 +116,7 @@ fn dib(n: u32, rgba: &[u8]) -> Vec<u8> {
             out.extend([rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
         }
     }
-    out.extend(vec![0u8; ((n + 31) / 32 * 4 * n) as usize]);
+    out.extend(vec![0u8; (n.div_ceil(32) * 4 * n) as usize]);
     out
 }
 

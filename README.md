@@ -78,6 +78,12 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
   not reopened (a node shell starts a privileged pod).
 - **No Windows "ding" while typing**: keys that reach the window while nothing has the keyboard
   focus (after a native dialog, for one) used to beep; the window takes the focus back.
+- **Lists by keyboard**: with the pointer over a list, Up/Down, Page Up/Down and Home/End move the
+  selection (Shift extends it), Enter opens the row in a tab, Delete asks to delete the selection.
+  **Export** saves the rows shown, with the columns shown, as CSV or JSON.
+- **Copy as kubectl** (row menu, details bar): `get -o yaml`, `describe`, `logs -f`, `exec -it` for the
+  object, with the kubeconfig file and context in the command. Pod details also show each container's
+  environment (references to Secrets and ConfigMaps are links; their values are never read).
 - **Image column** on pods and every workload (deployments, stateful/daemon/replica sets, jobs, cron jobs):
   `name:version` of each container image, the full registry reference on hover.
 - **Older clusters** (k3s v1.23 and other Kubernetes before 1.26) are discovered group by group.
@@ -86,7 +92,8 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 - **Accent color per cluster**: tab title, outline, frame and selections, also on the logs,
   terminals and editors opened from it. New clusters get a free color (a neon one under AMOLED); right-click a
   cluster pill or context for soft and neon swatches or any custom color.
-- **Dock tabs**: logs, pod shell, local terminal pinned to a context (no credentials copied), YAML editor.
+- **Dock tabs**: logs, pod shell, local terminal pinned to a context (no credentials copied, scrollback
+  set in Settings › Terminal), YAML editor.
   A terminal takes the keyboard when it opens, when its tab is picked or when clicked (accent outline),
   wherever the mouse is; a click elsewhere gives it back (patched egui_term in `vendor/egui_term`).
 - **Overview**: cluster CPU/memory/pods, per-node usage, live warning events (repeats grouped);
@@ -96,10 +103,29 @@ Requires `kubectl` on PATH for terminals, pod shells, drain and port-forward.
 ## Develop
 
 ```
-cargo test
+cargo test --release
+cargo clippy --release --all-targets
+cargo fmt --check
 ```
 
-`.cargo/config.toml` keeps build output outside OneDrive.
+Windows only (winit/Win32/OLE), Rust 1.92 or newer (`rust-toolchain.toml`). A fresh clone builds as is:
+the patched egui is in `vendor/egui` and the patched terminal in `vendor/egui_term` (both documented in
+their `KXS_PATCH.md`). To keep build output outside a synced folder, copy `.cargo/config.toml.example` to
+`.cargo/config.toml` (git-ignored) and set `target-dir`. GitHub Actions (`.github/workflows/ci.yml`) runs
+the tests, clippy and a release build on every push, and builds the MSI on a `v<version>` tag.
+
+Source layout (`src/`): `main.rs` (the app, dock, frame loop), `topbar.rs`, `settings.rs`, `tab.rs`,
+`keys.rs` (Windows keyboard hook), `cluster.rs` + `cluster/` (one cluster: pages, sidebar, tabs, actions,
+Helm, overview), `tabs/` (`logs/` with the buffer, stream, selection and drawing, `term.rs`, `yaml.rs`),
+`details.rs`, `list.rs`, `find.rs`, `watch.rs` (list + watch), `tasks.rs` (background tasks, `Lock`),
+`repaint.rs` (when background work may wake the window), `yamlhl.rs` (YAML colors), `units.rs`, `ops.rs`,
+`kubeconfig.rs`, `theme.rs`, `ui_kit.rs`, `dragout.rs`, `prof.rs`; `testkit.rs` has the egui test helpers
+and a fake API server. A mutex is locked with `Lock::locked` (a task that panicked must not take the
+window with it), and clippy warns on `unwrap` / `expect` outside tests.
+
+Performance work is measured, not guessed: `KXS_HUD=1` (or Ctrl+Shift+F12) shows a frame HUD with the
+reasons the app repainted, `KXS_TRACE=1` writes a startup timeline, and `cargo test --release -- --ignored
+--nocapture --test-threads=1 bench_` runs the benchmarks; `docs/PERF.md` has the baseline and the rules.
 
 ## Installer and releases
 
@@ -109,18 +135,24 @@ Needs WiX (`dotnet tool install --global wix`).
 build.bat                       # release build; the exe is copied to target\KXS-Watcher\
 build.bat msi                   # the same, plus the MSI
 .\build_msi.ps1                 # release build + MSI in target\KXS-Watcher\ (Cargo.toml's version)
-.\build_msi.ps1 -Version 0.2.0  # same, as MSI version 0.2.0 (tag forms like v.0.2.0 work too)
+.\build_msi.ps1 -Version 0.2.0  # an ad-hoc MSI with another version number (not for releases)
 .\publish_github.ps1 -Tag v0.2.0 -DryRun   # show what would be published
-.\publish_github.ps1 -Tag v0.2.0           # push the branch, tag, create the GitHub release, upload the MSI
+.\publish_github.ps1 -Tag v0.2.0           # push the branch, tag, create the GitHub release, upload the MSI + SHA-256
 .\publish_release.ps1                      # same, with the tag v<version from Cargo.toml>
 ```
 
 The MSI is a wizard: pick the install folder (default `%LocalAppData%\Programs\KXS Watcher`, per user,
 no admin prompt), Start menu and Desktop shortcuts, and launch at the end. Any installed version is
 replaced (a clean install, downgrades too). Running the same MSI again, or Settings → Installed apps →
-KXS Watcher → Modify, opens Change / Repair / Remove; Repair reinstalls every file and shortcut. Its version is the
-x.y.z in the tag (Cargo.toml's when the tag has none). Publishing
-refuses uncommitted changes and a tag that already exists on another commit.
+KXS Watcher → Modify, opens Change / Repair / Remove; Repair reinstalls every file and shortcut.
+
+The version lives in `Cargo.toml` only (shown in Settings → General): a release is the tag
+`v<that version>`, and publishing refuses any other tag, uncommitted changes, and a tag that already
+exists on another commit. Each MSI comes with a `.sha256` file; `CHANGELOG.md` lists what changed.
+
+## License
+
+MIT, see `LICENSE`. The vendored crates keep their own licenses (egui: MIT or Apache-2.0; egui_term: MIT).
 
 ## Developed by:
 - unnamed10110 (trojan.v6@gmail.com)

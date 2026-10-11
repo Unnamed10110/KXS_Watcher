@@ -5,9 +5,10 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use egui::epaint::RectShape;
 use egui::Modifiers;
 use egui::MouseWheelUnit;
+use egui::text::LayoutJob;
 use egui::Shape;
 use egui::Widget;
-use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Stroke, Vec2};
 use egui::{CornerRadius, Key};
 use egui::{Id, PointerButton};
 
@@ -239,7 +240,14 @@ impl<'a> TerminalView<'a> {
             global_bg,
         ))];
 
-        for indexed in content.grid.display_iter() {
+        // KXS: plain ASCII of one color along a row is laid out as one text (the grid pitch kept with
+        // `extra_letter_spacing`) instead of one galley per cell: ~100 shapes a screen, not ~6,000.
+        let font_id = self.font.font_type();
+        let advance = painter.fonts_mut(|f| f.glyph_width(&font_id, 'm'));
+        let pitch = cell_width;
+        let mut run: Option<TextRun> = None;
+
+        for indexed in &content.cells {
             let flags = indexed.cell.flags;
             let is_wide_char_spacer =
                 flags.contains(cell::Flags::WIDE_CHAR_SPACER);
@@ -264,7 +272,7 @@ impl<'a> TerminalView<'a> {
 
             let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
             let line_num =
-                indexed.point.line.0 + content.grid.display_offset() as i32;
+                indexed.point.line.0 + content.display_offset as i32;
             let y = layout_min.y + (cell_height * line_num as f32);
 
             let mut fg = self.theme.get_color(indexed.fg);
@@ -308,7 +316,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            if content.cursor_point == indexed.point {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
@@ -321,10 +329,26 @@ impl<'a> TerminalView<'a> {
             }
 
             // Draw text content
-            if indexed.c != ' ' && indexed.c != '\t' {
-                if content.grid.cursor.point == indexed.point
-                    && is_app_cursor_mode
-                {
+            let blank = indexed.c == ' ' || indexed.c == '\t';
+            let is_cursor = content.cursor_point == indexed.point;
+            let (row, col) = (indexed.point.line.0, indexed.point.column.0);
+            if !is_wide_char && !is_cursor && (blank || indexed.c.is_ascii_graphic()) {
+                if blank {
+                    if let Some(r) = run.as_mut().filter(|r| r.row == row && r.next_col == col) {
+                        r.spaces += 1;
+                        r.next_col += 1;
+                    }
+                } else if let Some(r) = run.as_mut().filter(|r| r.row == row && r.next_col == col && r.fg == fg) {
+                    r.text.extend(std::iter::repeat_n(' ', r.spaces));
+                    r.text.push(indexed.c);
+                    (r.spaces, r.next_col) = (0, col + 1);
+                } else {
+                    shapes.extend(run.take().map(|r| r.shape(painter, &font_id, pitch, advance)));
+                    run = Some(TextRun { x, y, row, next_col: col + 1, spaces: 0, fg, text: indexed.c.to_string() });
+                }
+            } else if !blank {
+                shapes.extend(run.take().map(|r| r.shape(painter, &font_id, pitch, advance)));
+                if is_cursor && is_app_cursor_mode {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
@@ -337,14 +361,40 @@ impl<'a> TerminalView<'a> {
                         },
                         Align2::CENTER_TOP,
                         indexed.c,
-                        self.font.font_type(),
+                        font_id.clone(),
                         fg,
                     )
                 }));
             }
         }
 
+        shapes.extend(run.map(|r| r.shape(painter, &font_id, pitch, advance)));
         painter.extend(shapes);
+    }
+}
+
+/// KXS: the text of consecutive cells of a row with the same color.
+struct TextRun {
+    /// Left edge and top of the first cell.
+    x: f32,
+    y: f32,
+    row: i32,
+    /// The column the next cell of the run would be in.
+    next_col: usize,
+    /// Blank cells after the text, written out only if more text follows.
+    spaces: usize,
+    fg: Color32,
+    text: String,
+}
+
+impl TextRun {
+    /// `pitch`: width of a cell; `advance`: width of a glyph of the font. Each glyph is moved to its
+    /// cell, as drawing the cells one by one would put it.
+    fn shape(self, painter: &Painter, font: &FontId, pitch: f32, advance: f32) -> Shape {
+        let mut job = LayoutJob::simple_singleline(self.text, font.clone(), self.fg);
+        job.sections[0].format.extra_letter_spacing = pitch - advance;
+        let galley = painter.fonts_mut(|f| f.layout_job(job));
+        Shape::galley(Pos2::new(self.x + (pitch - advance) / 2.0, self.y), galley, self.fg)
     }
 }
 
@@ -613,7 +663,7 @@ fn process_mouse_move(
         cursor_x,
         cursor_y,
         &terminal_content.terminal_size,
-        terminal_content.grid.display_offset(),
+        terminal_content.display_offset,
     );
 
     let mut actions = vec![];

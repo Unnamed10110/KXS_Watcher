@@ -545,6 +545,30 @@ pub fn dot(ui: &mut Ui, color: Color32, r: f32) -> Response {
     resp
 }
 
+/// A loading spinner. egui's asks for a repaint on every frame it is visible (60 a second for as
+/// long as something loads); this one is drawn 14 times a second and asks for nothing more.
+pub fn spinner(ui: &mut Ui) -> Response {
+    const STEP: f64 = 0.07;
+    let size = ui.style().spacing.interact_size.y;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    if ui.is_rect_visible(rect) {
+        crate::repaint::after(ui.ctx(), std::time::Duration::from_secs_f64(STEP));
+        let time = (ui.input(|i| i.time) / STEP).floor() * STEP;
+        let (start, radius) = (time * std::f64::consts::TAU, rect.width() / 2.0 - 2.0);
+        let end = start + 240f64.to_radians() * time.sin();
+        let n = (radius.round() as u32).clamp(8, 128);
+        let points = (0..n)
+            .map(|i| {
+                let (sin, cos) = egui::emath::lerp(start..=end, f64::from(i) / f64::from(n)).sin_cos();
+                rect.center() + radius * vec2(cos as f32, sin as f32)
+            })
+            .collect();
+        ui.painter().add(Shape::line(points, Stroke::new(3.0, ui.visuals().strong_text_color())));
+    }
+    resp
+}
+
 /// Count badge painted with its right edge at `right_center` (sidebar Events, the bell).
 pub fn badge(ui: &Ui, right_center: Pos2, text: &str, color: Color32) {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), semibold(10.5), status_fg(ui, color));
@@ -648,6 +672,71 @@ pub fn reorder(ui: &Ui, items: &[(Rect, bool, bool)]) -> Option<(usize, usize)> 
     items[from].2.then_some((from, if slot > from { slot - 1 } else { slot }))
 }
 
+/// A tab being renamed: whose it is and the text typed so far. The tab is a text box meanwhile:
+/// Enter keeps what was typed, Esc the old name.
+pub struct Rename<K> {
+    pub key: K,
+    text: String,
+    focused: bool,
+}
+
+impl<K> Rename<K> {
+    pub fn new(key: K, text: String) -> Self {
+        Rename { key, text, focused: false }
+    }
+
+    /// The box in place of the tab: its rect (for `reorder`), and once it lost focus the name typed
+    /// (trimmed, maybe empty), or `None` after Esc.
+    pub fn ui(&mut self, ui: &mut Ui, width: f32) -> (Rect, Option<Option<String>>) {
+        let r = ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(width).font(semibold(13.0)));
+        if !std::mem::replace(&mut self.focused, true) {
+            r.request_focus();
+        }
+        let done = r.lost_focus().then(|| (!ui.input(|i| i.key_pressed(egui::Key::Escape))).then(|| self.text.trim().to_string()));
+        (r.rect, done)
+    }
+}
+
+/// "Move left" / "Move right" in the menu of tab `i` of `n`: (from, to) when one is picked.
+pub fn move_menu(ui: &mut Ui, i: usize, n: usize) -> Option<(usize, usize)> {
+    let mut moved = None;
+    if i > 0 && ui.button("Move left").clicked() {
+        moved = Some((i, i - 1));
+        ui.close();
+    }
+    if i + 1 < n && ui.button("Move right").clicked() {
+        moved = Some((i, i + 1));
+        ui.close();
+    }
+    moved
+}
+
+/// What a tab's menu asked to close.
+pub enum Close {
+    This,
+    Others,
+    All,
+}
+
+/// "Close", "Close others" and "Close all" in a tab's menu.
+pub fn close_menu(ui: &mut Ui) -> Option<Close> {
+    let mut picked = None;
+    for (text, what) in [("Close", Close::This), ("Close others", Close::Others), ("Close all", Close::All)] {
+        if ui.button(text).clicked() {
+            picked = Some(what);
+            ui.close();
+        }
+    }
+    picked
+}
+
+/// Keeps only `v[keep]` (nothing when `keep` is `None` or out of range): "Close others", "Close all".
+pub fn keep_only<T>(v: &mut Vec<T>, keep: Option<usize>) {
+    let kept = keep.filter(|&i| i < v.len()).map(|i| v.swap_remove(i));
+    v.clear();
+    v.extend(kept);
+}
+
 /// Removes `v[i]`; `cur` stays on its item, or on the one that takes its place (the left one at the end).
 pub fn remove_item<T>(v: &mut Vec<T>, i: usize, cur: &mut usize) {
     if i >= v.len() {
@@ -680,6 +769,49 @@ pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize, cur: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spinner_wakes_the_ui_14_times_a_second_not_every_frame() {
+        let mut h = crate::testkit::Harness::new(egui::vec2(200.0, 100.0));
+        let delay = |h: &mut crate::testkit::Harness, ours: bool| {
+            (0..4).map(|_| h.frame_delay(vec![], |ui| drop(if ours { spinner(ui) } else { ui.spinner() }))).last().unwrap()
+        };
+        assert_eq!(delay(&mut h, false), std::time::Duration::ZERO, "egui's own: a repaint on every frame");
+        let d = delay(&mut h, true);
+        assert!((0.04..0.08).contains(&d.as_secs_f64()), "{d:?}"); // 70 ms less the frame itself
+    }
+
+    #[test]
+    fn close_others_and_all_keep_one_tab_or_none() {
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        keep_only(&mut v, Some(2));
+        assert_eq!(v, ['c']);
+        keep_only(&mut v, Some(5)); // gone already: nothing stays
+        assert!(v.is_empty());
+        let mut v = vec!['a', 'b'];
+        keep_only(&mut v, None);
+        assert!(v.is_empty());
+    }
+
+    /// The tab turns into a text box: Enter keeps the typed name, Esc leaves the old one.
+    #[test]
+    fn renaming_a_tab_ends_with_enter_or_escape() {
+        use egui::{Key, Modifiers};
+        let mut h = crate::testkit::Harness::themed(egui::vec2(300.0, 100.0));
+        let mut run = |end: Key| {
+            let mut rn = Rename::new(1u64, "Pods".into());
+            let frame = |h: &mut crate::testkit::Harness, events: Vec<egui::Event>, rn: &mut Rename<u64>| {
+                let mut out = None;
+                h.frame(events, |ui| out = Some(rn.ui(ui, 120.0).1));
+                out.unwrap()
+            };
+            assert!(frame(&mut h, vec![], &mut rn).is_none(), "open, focused");
+            frame(&mut h, vec![egui::Event::Text("x ".into())], &mut rn);
+            frame(&mut h, vec![crate::testkit::key(end, Modifiers::NONE)], &mut rn)
+        };
+        assert_eq!(run(Key::Enter), Some(Some("Podsx".to_string())), "trimmed");
+        assert_eq!(run(Key::Escape), Some(None), "cancelled");
+    }
 
     #[test]
     fn moving_keeps_the_current_item() {

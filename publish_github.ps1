@@ -1,13 +1,15 @@
 <#
 .SYNOPSIS
-  Publish to GitHub under a tag you choose: push the code, tag it, create the release, upload the MSI.
+  Publish to GitHub as release v<version>: push the code, tag it, create the release, upload the MSI.
 .DESCRIPTION
+  The version lives in one place, Cargo.toml: the tag must be exactly v<that version> (bump it there
+  first for a new release; v0.3.0-rc1 style pre-release versions work too). The exe, the MSI and the
+  tag then always agree.
   1. Pushes the current branch to `origin`.
   2. Creates the annotated tag (on the current commit) and pushes it.
-  3. Builds the MSI with build_msi.ps1. Its version is the x.y.z found in the tag (v1.2.3, 1.2.3-rc1,
-     release-1.2.3); tags without one use the version in Cargo.toml.
-  4. Creates the GitHub release for the tag (or reuses it) and uploads the MSI, replacing an asset
-     with the same name.
+  3. Builds the MSI with build_msi.ps1 (version from Cargo.toml) and its SHA-256 file.
+  4. Creates the GitHub release for the tag (or reuses it) and uploads the MSI and the checksum,
+     replacing assets with the same name.
 
   Token, first found: $env:GITHUB_TOKEN, $env:GH_TOKEN, `gh auth token`, or the github.com
   credential Git already uses (Git Credential Manager). It needs Contents: read and write.
@@ -15,7 +17,7 @@
   Refuses to run with uncommitted changes (the MSI would not match the tagged commit) or when the
   tag already exists on another commit.
 .EXAMPLE
-  .\publish_github.ps1 -Tag v0.2.0
+  .\publish_github.ps1 -Tag v0.2.0           # Cargo.toml says version = "0.2.0"
 .EXAMPLE
   .\publish_github.ps1 -Tag v0.2.0-rc1 -Prerelease -Notes "Search in configs and secrets"
 .EXAMPLE
@@ -39,6 +41,10 @@ function Invoke-Git { $out = git @args; if ($LASTEXITCODE) { throw "git $args fa
 # --- checks before anything is built or pushed
 git check-ref-format "refs/tags/$Tag"
 if ($LASTEXITCODE) { throw "'$Tag' is not a valid tag name" }
+$cargoVersion = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages | Where-Object name -eq 'kxs-watcher' | ForEach-Object version
+if ($Tag -ne "v$cargoVersion") {
+    throw "Tag '$Tag' must be v$cargoVersion, the version in Cargo.toml. Bump the version there first for a new release."
+}
 $url = Invoke-Git remote get-url origin
 if ($url -notmatch 'github\.com[:/](?<owner>[^/]+)/(?<repo>[^/]+?)(\.git)?/?$') { throw "origin is not a GitHub repository: $url" }
 $slug = "$($Matches.owner)/$($Matches.repo)"
@@ -54,15 +60,14 @@ if ($tagged -and $tagged -ne $head) {
 }
 
 # --- MSI
-$version = if ($Tag -match '\d+\.\d+\.\d+') { $Matches[0] } else { '' }   # empty: Cargo.toml's
-$msi = & (Join-Path $PSScriptRoot 'build_msi.ps1') -SkipBuild:$SkipBuild -Version $version | Select-Object -Last 1
-$asset = Split-Path $msi -Leaf
+$msi = & (Join-Path $PSScriptRoot 'build_msi.ps1') -SkipBuild:$SkipBuild -Version $cargoVersion | Select-Object -Last 1
+$assets = @($msi, "$msi.sha256")   # build_msi.ps1 writes the checksum next to the MSI
 
 Write-Host "Repository : $slug"
 Write-Host "Branch     : $(if ($branch -eq 'HEAD') { '(detached, not pushed)' } else { $branch })"
 Write-Host "Release    : $Tag$(if ($Draft) { ' (draft)' })$(if ($Prerelease) { ' (pre-release)' })"
 Write-Host "Commit     : $head"
-Write-Host "Asset      : $msi"
+Write-Host "Assets     : $($assets -join ', ')"
 if ($DryRun) {
     Write-Host "Dry run: nothing tagged, pushed or uploaded." -ForegroundColor Yellow
     return
@@ -113,12 +118,15 @@ if (-not $release) {
     Write-Host "Updating existing release $Tag"
 }
 
-# --- asset (replace one with the same name)
-foreach ($old in @($release.assets | Where-Object name -eq $asset)) {
-    Invoke-RestMethod "$api/releases/assets/$($old.id)" -Method Delete -Headers $headers | Out-Null
-    Write-Host "Replaced previous $asset"
+# --- assets (replace ones with the same name)
+foreach ($file in $assets) {
+    $asset = Split-Path $file -Leaf
+    foreach ($old in @($release.assets | Where-Object name -eq $asset)) {
+        Invoke-RestMethod "$api/releases/assets/$($old.id)" -Method Delete -Headers $headers | Out-Null
+        Write-Host "Replaced previous $asset"
+    }
+    $upload = ($release.upload_url -replace '\{.*\}$', '') + "?name=$([uri]::EscapeDataString($asset))"
+    Invoke-RestMethod $upload -Method Post -Headers $headers -ContentType 'application/octet-stream' -InFile $file | Out-Null
 }
-$upload = ($release.upload_url -replace '\{.*\}$', '') + "?name=$([uri]::EscapeDataString($asset))"
-Invoke-RestMethod $upload -Method Post -Headers $headers -ContentType 'application/octet-stream' -InFile $msi | Out-Null
 
 Write-Host "Published: $($release.html_url)" -ForegroundColor Green

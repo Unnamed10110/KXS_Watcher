@@ -1,3 +1,5 @@
+// A build script that cannot write its files should stop the build.
+#![allow(clippy::expect_used)]
 //! Windows exe resources: the app icon (drawn in src/icon.rs) and version info, so Explorer, the
 //! taskbar, the Start menu and Installed apps show them.
 #[path = "src/icon.rs"]

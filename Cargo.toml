@@ -1,7 +1,10 @@
 [package]
 name = "kxs-watcher"
-version = "0.1.0"
+version = "2.4.0"
+license = "MIT"
 edition = "2024"
+# eframe/egui 0.35 need 1.92; let-chains (used throughout) need 1.88.
+rust-version = "1.92"
 description = "Fast, lightweight native Kubernetes / k3s desktop GUI"
 
 [dependencies]
@@ -10,13 +13,14 @@ egui = "0.35.0"
 # ponytail: needs OpenGL 3+; switch back to "wgpu" for GPU-less RDP/VM hosts if that matters.
 eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
 # serde: tables keep their column widths across restarts.
-egui_extras = { version = "0.35.0", default-features = false, features = ["syntect", "serde"] }
+egui_extras = { version = "0.35.0", default-features = false, features = ["serde"] }
 # eframe's own winit, for its Windows message hook (Alt codes, see `alt_codes` in main.rs).
 winit = { version = "0.30", default-features = false }
 egui_dock = "0.20.1"
 # egui_term rev 31bbc7a: typing reaches the focused terminal wherever the pointer is (vendor/egui_term/KXS_PATCH.md).
 egui_term = { path = "vendor/egui_term" }
-kube = "4.2.0"
+# gzip: the API server compresses big LIST answers (WAN/VPN clusters), tower-http decompresses them.
+kube = { version = "4.2.0", features = ["gzip"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "process", "io-util", "macros"] }
 futures = "0.3"
@@ -32,7 +36,25 @@ rfd = { version = "0.17.2", default-features = false }
 # Drag selected text out of the window (src/dragout.rs). Both are already built for accesskit; this
 # only adds `windows` features. `windows-core`: the #[implement] macro names it.
 windows-core = "0.62"
-windows = { version = "0.62", features = ["Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+# The mock API server of the watch tests (already built for kube).
+tower-service = "0.3"
+# Tests with sleeps (log stream backoff) run on a paused clock.
+tokio = { version = "1", features = ["test-util"] }
+
+[features]
+# `cargo build --features profile`: count allocations (shown in the HUD, see src/prof.rs).
+profile = []
+
+[lints.clippy]
+# A mutex goes through `Lock::locked` (a dead task must not take the window with it); the few
+# `expect`s left are at startup, where there is nothing to fall back to. Tests may unwrap (clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+# A few view-state structs hold tuple-heavy fields that read better inline than behind aliases.
+type_complexity = "allow"
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -41,6 +63,69 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The crates that talk to the cluster or the OS run a few times a second at most: size over speed.
+# Measured (docs/PERF.md, 3.8): exe 23.69 -> 22.61 MB, and the idle private memory of a session from
+# ~100 to ~62 MB (the cause of that second part is not known; fat LTO shows the same drop).
+[profile.release.package.k8s-openapi]
+opt-level = "s"
+
+[profile.release.package.kube]
+opt-level = "s"
+
+[profile.release.package.kube-client]
+opt-level = "s"
+
+[profile.release.package.kube-core]
+opt-level = "s"
+
+[profile.release.package.hyper]
+opt-level = "s"
+
+[profile.release.package.hyper-util]
+opt-level = "s"
+
+[profile.release.package.hyper-rustls]
+opt-level = "s"
+
+[profile.release.package.rustls]
+opt-level = "s"
+
+[profile.release.package.rustls-webpki]
+opt-level = "s"
+
+[profile.release.package.tokio-rustls]
+opt-level = "s"
+
+[profile.release.package.tower]
+opt-level = "s"
+
+[profile.release.package.tower-http]
+opt-level = "s"
+
+[profile.release.package.async-compression]
+opt-level = "s"
+
+[profile.release.package.flate2]
+opt-level = "s"
+
+[profile.release.package.miniz_oxide]
+opt-level = "s"
+
+[profile.release.package.rfd]
+opt-level = "s"
+
+[profile.release.package.windows]
+opt-level = "s"
+
+[profile.release.package.windows-sys]
+opt-level = "s"
+
+[profile.release.package.accesskit]
+opt-level = "s"
+
+[profile.release.package.accesskit_windows]
+opt-level = "s"
 
 # egui 0.35.0 with editor-style text selection: double-click selects whole IPs, names and labels,
 # double-click + drag extends by words (vendor/egui/KXS_PATCH.md). Drop when upgrading egui.

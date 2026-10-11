@@ -11,7 +11,9 @@ use kube::Client;
 use serde_json::{json, Value};
 
 use crate::kubeconfig::Ctx;
-use crate::watch::Bg;
+use crate::watch::{Bg, Lock};
+
+pub use crate::units::{fmt_bytes, fmt_cpu, parse_qty};
 
 pub type Res<T = String> = Result<T, String>;
 
@@ -364,50 +366,6 @@ pub async fn events_for(client: Client, ns: String, uid: String) -> Res<Vec<Ev>>
     .await)
 }
 
-/// Kubernetes quantity → f64 (cores for CPU, bytes for memory).
-pub fn parse_qty(s: &str) -> f64 {
-    let s = s.trim();
-    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+')).unwrap_or(s.len());
-    let (num, suffix) = s.split_at(split);
-    let n: f64 = num.parse().unwrap_or(0.0);
-    let mult = match suffix {
-        "" => 1.0,
-        "n" => 1e-9,
-        "u" => 1e-6,
-        "m" => 1e-3,
-        "k" => 1e3,
-        "M" => 1e6,
-        "G" => 1e9,
-        "T" => 1e12,
-        "P" => 1e15,
-        "E" => 1e18,
-        "Ki" => 1024.0,
-        "Mi" => 1024f64.powi(2),
-        "Gi" => 1024f64.powi(3),
-        "Ti" => 1024f64.powi(4),
-        "Pi" => 1024f64.powi(5),
-        "Ei" => 1024f64.powi(6),
-        e if e.starts_with(['e', 'E']) => 10f64.powf(e[1..].parse().unwrap_or(0.0)),
-        _ => 1.0,
-    };
-    n * mult
-}
-
-pub fn fmt_cpu(cores: f64) -> String {
-    if cores < 1.0 { format!("{:.0}m", cores * 1000.0) } else { format!("{cores:.2}") }
-}
-
-pub fn fmt_bytes(b: f64) -> String {
-    const U: [&str; 5] = ["B", "Ki", "Mi", "Gi", "Ti"];
-    let mut v = b;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i >= 3 { format!("{v:.1}{}", U[i]) } else { format!("{v:.0}{}", U[i]) }
-}
-
 #[derive(Default)]
 pub struct Metrics {
     /// node → (cpu cores, memory bytes) in use
@@ -449,10 +407,10 @@ pub async fn count_loop(client: Client, kinds: Vec<Kind>, ns: Vec<String>, out: 
                 }
             }
             if let Some(n) = total {
-                out.lock().unwrap().insert((k.ar.group.clone(), k.ar.kind.clone()), n);
+                out.locked().insert((k.ar.group.clone(), k.ar.kind.clone()), n);
             }
         }
-        ctx.request_repaint();
+        crate::repaint::now(&ctx);
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
@@ -482,13 +440,13 @@ pub async fn metrics_loop(client: Client, has_metrics: bool, out: Arc<Mutex<Metr
         }
         .await;
         {
-            let mut o = out.lock().unwrap();
+            let mut o = out.locked();
             match r {
                 Ok(m) => *o = Metrics { at: Some(std::time::Instant::now()), ..m },
                 Err(e) => o.error = Some(err_text(&e)),
             }
         }
-        ctx.request_repaint();
+        crate::repaint::now(&ctx);
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
@@ -546,24 +504,26 @@ pub fn port_forward(kctx: &Ctx, ns: &str, target: &str, remote: u16, ctx: &egui:
     let bg = Bg::spawn(async move {
         let mut child = match c.spawn() {
             Ok(ch) => ch,
-            Err(e) => return *s.lock().unwrap() = format!("kubectl: {e}"),
+            Err(e) => return *s.locked() = format!("kubectl: {e}"),
         };
-        let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        let mut err = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return *s.locked() = "kubectl: no output pipes".into();
+        };
+        let (mut out, mut err) = (tokio::io::BufReader::new(stdout).lines(), tokio::io::BufReader::new(stderr).lines());
         let mut last_err = String::new();
         loop {
             tokio::select! {
                 Ok(Some(line)) = out.next_line() => {
                     // "Forwarding from 127.0.0.1:54321 -> 80"
                     if let Some(p) = line.strip_prefix("Forwarding from 127.0.0.1:").and_then(|r| r.split_whitespace().next()).and_then(|p| p.parse().ok()) {
-                        *l.lock().unwrap() = Some(p);
-                        *s.lock().unwrap() = "active".into();
+                        *l.locked() = Some(p);
+                        *s.locked() = "active".into();
                     }
                 }
                 Ok(Some(line)) = err.next_line() => last_err = line,
                 st = child.wait() => {
-                    *l.lock().unwrap() = None;
-                    *s.lock().unwrap() = format!("exited ({}) {last_err}", st.map(|s| s.to_string()).unwrap_or_default());
+                    *l.locked() = None;
+                    *s.locked() = format!("exited ({}) {last_err}", st.map(|s| s.to_string()).unwrap_or_default());
                     break;
                 }
             }

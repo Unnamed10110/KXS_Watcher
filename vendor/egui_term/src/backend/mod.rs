@@ -15,13 +15,14 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
-use alacritty_terminal::{tty, Grid};
+use alacritty_terminal::tty;
 use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
-use std::ops::{Index, RangeInclusive};
+use std::ops::{Deref, Index, RangeInclusive};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
 
@@ -141,6 +142,9 @@ pub struct TerminalBackend {
     size: TerminalSize,
     notifier: Notifier,
     last_content: RenderableContent,
+    /// KXS: the terminal changed since the last `sync` (output, or something done to it). Set by the
+    /// thread that forwards the PTY's events and by `process_command`.
+    dirty: Arc<AtomicBool>,
 }
 
 impl TerminalBackend {
@@ -155,7 +159,10 @@ impl TerminalBackend {
             working_directory: settings.working_directory,
             ..tty::Options::default()
         };
-        let config = term::Config::default();
+        let config = term::Config {
+            scrolling_history: settings.scrollback,
+            ..term::Config::default()
+        };
         let terminal_size = TerminalSize::default();
         let pty = tty::new(&pty_config, terminal_size.into(), id)?;
         #[cfg(not(windows))]
@@ -173,13 +180,13 @@ impl TerminalBackend {
         let event_proxy = EventProxy(event_sender);
         let mut term = Term::new(config, &terminal_size, event_proxy.clone());
         let initial_content = RenderableContent {
-            grid: term.grid().clone(),
-            selectable_range: None,
             terminal_mode: *term.mode(),
             terminal_size,
             cursor: term.grid_mut().cursor_cell().clone(),
-            hovered_hyperlink: None,
+            ..RenderableContent::default()
         };
+        let dirty = Arc::new(AtomicBool::new(true));
+        let event_dirty = dirty.clone();
         let term = Arc::new(FairMutex::new(term));
         let pty_event_loop =
             EventLoop::new(term.clone(), event_proxy, pty, false, false)?;
@@ -191,6 +198,7 @@ impl TerminalBackend {
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
                 if let Ok(event) = event_receiver.recv() {
+                    event_dirty.store(true, Ordering::Release);
                     pty_event_proxy_sender
                         .send((id, event.clone()))
                         .unwrap_or_else(|_| {
@@ -213,10 +221,15 @@ impl TerminalBackend {
             size: terminal_size,
             notifier,
             last_content: initial_content,
+            dirty,
         })
     }
 
     pub fn process_command(&mut self, cmd: BackendCommand) {
+        // The view sends a resize every frame; it is a change only when the size is another one.
+        if !matches!(cmd, BackendCommand::Resize(..)) {
+            self.dirty.store(true, Ordering::Release);
+        }
         let term = self.term.clone();
         let mut term = term.lock();
         match cmd {
@@ -264,7 +277,7 @@ impl TerminalBackend {
         let content = self.last_content();
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
+            for indexed in &content.cells {
                 if range.contains(indexed.point) {
                     result.push(indexed.c);
                 }
@@ -273,7 +286,12 @@ impl TerminalBackend {
         result
     }
 
+    /// KXS: copies the screen (not the scrollback: upstream cloned the whole grid on every frame, 10 ms
+    /// with a full history) and only when something changed since the last call.
     pub fn sync(&mut self) -> &RenderableContent {
+        if !self.dirty.swap(false, Ordering::Acquire) {
+            return &self.last_content;
+        }
         let term = self.term.clone();
         let mut terminal = term.lock();
         let selectable_range = match &terminal.selection {
@@ -282,12 +300,21 @@ impl TerminalBackend {
         };
 
         let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
-        self.last_content.selectable_range = selectable_range;
-        self.last_content.cursor = cursor.clone();
-        self.last_content.terminal_mode = *terminal.mode();
-        self.last_content.terminal_size = self.size;
-        self.last_content()
+        let grid = terminal.grid();
+        let content = &mut self.last_content;
+        content.cells.clear();
+        content.cells.extend(grid.display_iter().map(|i| IndexedCell {
+            point: i.point,
+            cell: i.cell.clone(),
+        }));
+        content.generation += 1;
+        content.display_offset = grid.display_offset();
+        content.cursor_point = grid.cursor.point;
+        content.selectable_range = selectable_range;
+        content.cursor = cursor;
+        content.terminal_mode = *terminal.mode();
+        content.terminal_size = self.size;
+        &self.last_content
     }
 
     pub fn last_content(&self) -> &RenderableContent {
@@ -320,18 +347,20 @@ impl TerminalBackend {
                 self.last_content.hovered_hyperlink = None;
             },
             LinkAction::Open => {
-                self.open_link();
+                self.open_link(terminal);
             },
         };
     }
 
-    fn open_link(&self) {
+    fn open_link(&self, terminal: &Term<EventProxy>) {
         if let Some(range) = &self.last_content.hovered_hyperlink {
             let start = range.start();
             let end = range.end();
 
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
+            // KXS: from the terminal itself, the copy kept for drawing holds the screen only.
+            let grid = terminal.grid();
+            let mut url = String::from(grid.index(*start).c);
+            for indexed in grid.iter_from(*start) {
                 url.push(indexed.c);
                 if indexed.point == *end {
                     break;
@@ -495,6 +524,7 @@ impl TerminalBackend {
                 num_cols: cols,
             };
 
+            self.dirty.store(true, Ordering::Release);
             self.notifier.on_resize(self.size.into());
             terminal.resize(TermSize::new(
                 self.size.num_cols as usize,
@@ -563,8 +593,27 @@ fn visible_regex_match_iter<'a>(
         .take_while(move |rm| rm.start().line <= viewport_end)
 }
 
+/// A cell of the screen and where it is.
+pub struct IndexedCell {
+    pub point: Point,
+    pub cell: Cell,
+}
+
+impl Deref for IndexedCell {
+    type Target = Cell;
+
+    fn deref(&self) -> &Cell {
+        &self.cell
+    }
+}
+
 pub struct RenderableContent {
-    pub grid: Grid<Cell>,
+    /// KXS: the cells on screen (`Grid::display_iter`), not the grid with its scrollback.
+    pub cells: Vec<IndexedCell>,
+    pub display_offset: usize,
+    pub cursor_point: Point,
+    /// Counts the copies of the screen made by `sync`.
+    pub generation: u64,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
@@ -575,7 +624,10 @@ pub struct RenderableContent {
 impl Default for RenderableContent {
     fn default() -> Self {
         Self {
-            grid: Grid::new(0, 0, 0),
+            cells: Vec::new(),
+            display_offset: 0,
+            cursor_point: Point::default(),
+            generation: 0,
             hovered_hyperlink: None,
             selectable_range: None,
             cursor: Cell::default(),
